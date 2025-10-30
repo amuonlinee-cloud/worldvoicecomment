@@ -1,70 +1,51 @@
 // netlify/functions/telegram.js
-const { URL } = require('url');
-const { Telegraf } = require('telegraf');
-
-// NOTE: make sure TELEGRAM_BOT_TOKEN and NETLIFY_WEBHOOK_SECRET are set in Netlify env
-const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const WEBHOOK_SECRET = process.env.NETLIFY_WEBHOOK_SECRET;
-
-if (!BOT_TOKEN) {
-  console.error('MISSING TELEGRAM_BOT_TOKEN env');
-}
-
-// Keep bot instance cached across warm Lambda invocations
-let bot;
-function getBot() {
-  if (bot) return bot;
-  bot = new Telegraf(BOT_TOKEN);
-
-  // IMPORTANT: load your bot handlers here (or require your bot.js that exports a register function)
-  // Example: require('../../src/bot_factory')(bot)  OR initialize inside this file.
-  //
-  // If you already have a function initBot() in src/bot.js that returns a Telegraf instance,
-  // you can require and call it here instead. For simplicity you can have your src/bot.js expose
-  // a "registerHandlers" function that receives bot and attaches all handlers.
-
-  // Example:
-  // const register = require('../../src/netlify_bot_init');
-  // register(bot);
-
-  // If your current src/bot.js returns a full Telegraf instance and calls bot.launch(),
-  // do NOT call launch() here. Instead refactor so this function only registers handlers.
-  //
-  return bot;
-}
+// Debug webhook for Telegram -> Netlify. Accepts GET and POST.
+// Expects ?token=SECRET and process.env.NETLIFY_WEBHOOK_SECRET set in Netlify site settings.
 
 exports.handler = async function (event, context) {
   try {
-    // verify webhook secret in query param
-    const url = new URL((process.env.NETLIFY_SITE_URL || 'https://example.com') + (event.path || ''));
-    // Netlify passes query params on event.queryStringParameters
+    const secretEnv = process.env.NETLIFY_WEBHOOK_SECRET || '';
     const token = (event.queryStringParameters && event.queryStringParameters.token) || '';
 
-    if (!WEBHOOK_SECRET || token !== WEBHOOK_SECRET) {
-      return {
-        statusCode: 404,
-        body: 'Not found'
-      };
+    // quick human-friendly logs:
+    console.log('--- netlify debug telegram function ---');
+    console.log('Method:', event.httpMethod);
+    console.log('Path:', event.path);
+    console.log('Query:', JSON.stringify(event.queryStringParameters || {}));
+    console.log('Headers:', JSON.stringify(event.headers || {}));
+    console.log('Body preview:', event.body ? event.body.slice(0, 1000) : null);
+
+    if (!token) {
+      return { statusCode: 400, body: 'Missing token query param' };
+    }
+    if (!secretEnv) {
+      return { statusCode: 500, body: 'Missing NETLIFY_WEBHOOK_SECRET env on server' };
+    }
+    if (token !== secretEnv) {
+      return { statusCode: 401, body: 'Invalid token' };
     }
 
-    // Create bot if not already
-    const bot = getBot();
+    // Accept both GET (health) and POST (webhook)
+    if (event.httpMethod === 'GET') {
+      return { statusCode: 200, body: JSON.stringify({ ok: true, msg: 'debug ok', time: new Date().toISOString() }) };
+    }
 
-    // parse body (incoming Telegram update)
-    const update = event.body && typeof event.body === 'string' ? JSON.parse(event.body) : event.body;
-
-    // Telegraf expects to get update and return promise
-    await bot.handleUpdate(update, context);
+    // For POST, echo minimal info so you can see Telegram's payload
+    let parsed = null;
+    try { parsed = event.body ? JSON.parse(event.body) : null; } catch (e) { parsed = { raw: event.body }; }
+    console.log('Parsed payload keys:', parsed ? Object.keys(parsed).slice(0,10) : null);
 
     return {
       statusCode: 200,
-      body: 'OK'
+      body: JSON.stringify({
+        ok: true,
+        received: !!event.body,
+        keys: parsed ? Object.keys(parsed) : null,
+        note: 'Webhook received and token OK'
+      })
     };
   } catch (err) {
-    console.error('netlify webhook error', err);
-    return {
-      statusCode: 500,
-      body: 'Internal Server Error'
-    };
+    console.error('Function error', err);
+    return { statusCode: 500, body: 'Internal error' };
   }
 };
