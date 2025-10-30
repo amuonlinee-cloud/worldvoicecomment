@@ -1,42 +1,70 @@
 // netlify/functions/telegram.js
-// Minimal webhook receiver for Telegram (Netlify function)
-// Place this at repo root: netlify/functions/telegram.js
+const { URL } = require('url');
+const { Telegraf } = require('telegraf');
+
+// NOTE: make sure TELEGRAM_BOT_TOKEN and NETLIFY_WEBHOOK_SECRET are set in Netlify env
+const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const WEBHOOK_SECRET = process.env.NETLIFY_WEBHOOK_SECRET;
+
+if (!BOT_TOKEN) {
+  console.error('MISSING TELEGRAM_BOT_TOKEN env');
+}
+
+// Keep bot instance cached across warm Lambda invocations
+let bot;
+function getBot() {
+  if (bot) return bot;
+  bot = new Telegraf(BOT_TOKEN);
+
+  // IMPORTANT: load your bot handlers here (or require your bot.js that exports a register function)
+  // Example: require('../../src/bot_factory')(bot)  OR initialize inside this file.
+  //
+  // If you already have a function initBot() in src/bot.js that returns a Telegraf instance,
+  // you can require and call it here instead. For simplicity you can have your src/bot.js expose
+  // a "registerHandlers" function that receives bot and attaches all handlers.
+
+  // Example:
+  // const register = require('../../src/netlify_bot_init');
+  // register(bot);
+
+  // If your current src/bot.js returns a full Telegraf instance and calls bot.launch(),
+  // do NOT call launch() here. Instead refactor so this function only registers handlers.
+  //
+  return bot;
+}
 
 exports.handler = async function (event, context) {
   try {
-    // Validate query token
-    const qs = event.queryStringParameters || {};
-    const token = qs.token || '';
-    const expected = process.env.NETLIFY_WEBHOOK_SECRET || '';
-    if (!expected || token !== expected) {
+    // verify webhook secret in query param
+    const url = new URL((process.env.NETLIFY_SITE_URL || 'https://example.com') + (event.path || ''));
+    // Netlify passes query params on event.queryStringParameters
+    const token = (event.queryStringParameters && event.queryStringParameters.token) || '';
+
+    if (!WEBHOOK_SECRET || token !== WEBHOOK_SECRET) {
       return {
-        statusCode: 403,
-        body: JSON.stringify({ ok: false, error: 'invalid webhook token' }),
+        statusCode: 404,
+        body: 'Not found'
       };
     }
 
-    // Accept only POST
-    if (event.httpMethod !== 'POST') {
-      return { statusCode: 200, body: 'OK' }; // respond to GET health-checks
-    }
+    // Create bot if not already
+    const bot = getBot();
 
-    // event.body is the raw JSON payload sent by Telegram
-    let update;
-    try {
-      update = event.body ? JSON.parse(event.body) : {};
-    } catch (err) {
-      console.error('failed to parse body', err);
-      return { statusCode: 400, body: 'bad request' };
-    }
+    // parse body (incoming Telegram update)
+    const update = event.body && typeof event.body === 'string' ? JSON.parse(event.body) : event.body;
 
-    // Log the update so you can see it in Netlify function logs
-    console.log('Telegram update received:', JSON.stringify(update).slice(0, 10000));
+    // Telegraf expects to get update and return promise
+    await bot.handleUpdate(update, context);
 
-    // TODO: forward update to your bot logic here (e.g. require a handler)
-    // For now, just ack Telegram so it stops retrying.
-    return { statusCode: 200, body: JSON.stringify({ ok: true }) };
+    return {
+      statusCode: 200,
+      body: 'OK'
+    };
   } catch (err) {
-    console.error('Unhandled error in webhook func', err);
-    return { statusCode: 500, body: JSON.stringify({ ok: false, error: 'internal' }) };
+    console.error('netlify webhook error', err);
+    return {
+      statusCode: 500,
+      body: 'Internal Server Error'
+    };
   }
 };
