@@ -1,51 +1,91 @@
 // netlify/functions/telegram.js
-// Debug webhook for Telegram -> Netlify. Accepts GET and POST.
-// Expects ?token=SECRET and process.env.NETLIFY_WEBHOOK_SECRET set in Netlify site settings.
+// Robust Netlify function wrapper for Telegram webhook.
+// Expects NETLIFY_WEBHOOK_SECRET env and your src/bot.js exporting initBot() (does NOT call bot.launch()).
 
-exports.handler = async function (event, context) {
-  try {
-    const secretEnv = process.env.NETLIFY_WEBHOOK_SECRET || '';
-    const token = (event.queryStringParameters && event.queryStringParameters.token) || '';
+const { initBot } = require('../../src/bot');
 
-    // quick human-friendly logs:
-    console.log('--- netlify debug telegram function ---');
-    console.log('Method:', event.httpMethod);
-    console.log('Path:', event.path);
-    console.log('Query:', JSON.stringify(event.queryStringParameters || {}));
-    console.log('Headers:', JSON.stringify(event.headers || {}));
-    console.log('Body preview:', event.body ? event.body.slice(0, 1000) : null);
+let botSingletonPromise = null;
+async function getBot() {
+  if (!botSingletonPromise) {
+    // initBot may be sync or async — normalize to a promise
+    botSingletonPromise = Promise.resolve().then(() => initBot());
+  }
+  return botSingletonPromise;
+}
 
-    if (!token) {
-      return { statusCode: 400, body: 'Missing token query param' };
-    }
-    if (!secretEnv) {
-      return { statusCode: 500, body: 'Missing NETLIFY_WEBHOOK_SECRET env on server' };
-    }
-    if (token !== secretEnv) {
-      return { statusCode: 401, body: 'Invalid token' };
-    }
+exports.handler = async (event, context) => {
+  const secret = process.env.NETLIFY_WEBHOOK_SECRET;
+  const qs = event.queryStringParameters || {};
+  const method = (event.httpMethod || 'GET').toUpperCase();
 
-    // Accept both GET (health) and POST (webhook)
-    if (event.httpMethod === 'GET') {
-      return { statusCode: 200, body: JSON.stringify({ ok: true, msg: 'debug ok', time: new Date().toISOString() }) };
-    }
-
-    // For POST, echo minimal info so you can see Telegram's payload
-    let parsed = null;
-    try { parsed = event.body ? JSON.parse(event.body) : null; } catch (e) { parsed = { raw: event.body }; }
-    console.log('Parsed payload keys:', parsed ? Object.keys(parsed).slice(0,10) : null);
-
+  // Health check
+  if (method === 'GET') {
     return {
       statusCode: 200,
-      body: JSON.stringify({
-        ok: true,
-        received: !!event.body,
-        keys: parsed ? Object.keys(parsed) : null,
-        note: 'Webhook received and token OK'
-      })
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ok: true, msg: 'debug ok', time: new Date().toISOString() })
     };
+  }
+
+  // Only accept POST for Telegram updates
+  if (method !== 'POST') {
+    return { statusCode: 405, body: 'Method Not Allowed' };
+  }
+
+  // Token check
+  if (!secret || !qs.token || qs.token !== secret) {
+    console.error('Missing or wrong token. Provided:', qs.token, 'Expected secret present?', !!secret);
+    return { statusCode: 403, body: 'Missing or invalid token' };
+  }
+
+  // Parse incoming body
+  let update;
+  try {
+    update = typeof event.body === 'string' ? JSON.parse(event.body) : event.body;
   } catch (err) {
-    console.error('Function error', err);
-    return { statusCode: 500, body: 'Internal error' };
+    console.error('Invalid JSON from Telegram webhook:', err);
+    return { statusCode: 400, body: 'Invalid JSON' };
+  }
+
+  // Acquire bot instance
+  let bot;
+  try {
+    bot = await getBot();
+    if (!bot || typeof bot.handleUpdate !== 'function') {
+      console.error('Bot returned from initBot is invalid (no handleUpdate). Bot:', !!bot);
+      return { statusCode: 500, body: 'Bot not initialized correctly' };
+    }
+  } catch (err) {
+    console.error('Failed to initialize bot singleton:', err && (err.stack || err));
+    // return 200 to avoid Telegram marking webhook down repeatedly — but log the error
+    return { statusCode: 200, body: 'OK (bot init error logged)' };
+  }
+
+  // Forward update to Telegraf and catch any runtime errors
+  try {
+    await bot.handleUpdate(update);
+    return { statusCode: 200, body: 'Webhook received and token OK' };
+  } catch (err) {
+    // Log full error for debugging in Netlify logs
+    console.error('Error in bot.handleUpdate:', err && (err.stack || err));
+
+    // Try to notify admins (optional) — safe best-effort
+    try {
+      const adminsEnv = process.env.ADMIN_IDS || '';
+      const admins = adminsEnv.split(',').map(s => s.trim()).filter(Boolean);
+      if (admins.length > 0 && bot.telegram && typeof bot.telegram.sendMessage === 'function') {
+        const short = (update.message && update.message.text) ? update.message.text.slice(0,200) : 'update';
+        for (const adm of admins) {
+          try {
+            await bot.telegram.sendMessage(Number(adm), `⚠️ Bot error occurred while handling an update.\nMessage preview: ${short}\nError: ${err.message || 'unknown'}`);
+          } catch (e) { /* ignore send errors */ }
+        }
+      }
+    } catch (notifyErr) {
+      console.error('Failed to notify admins:', notifyErr && (notifyErr.stack || notifyErr));
+    }
+
+    // Return 200 so Telegram stops sending repeated failure marks; the error is logged
+    return { statusCode: 200, body: 'OK (error logged)' };
   }
 };
