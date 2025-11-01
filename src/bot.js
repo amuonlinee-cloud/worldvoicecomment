@@ -1,4 +1,8 @@
 // src/bot.js
+// Main bot logic. Exports initBot() which returns a configured Telegraf instance.
+// It is webhook-friendly — index.js / netlify function should call bot.handleUpdate(req.body) for each incoming update.
+// Supports both LOCAL_POLLING mode (for dev) and webhook mode (for production).
+
 const { Telegraf, Markup } = require('telegraf');
 const db = require('./database');
 const { encodeShortCode, decodeShortCode, extractFirstUrl, isSupportedLink } = require('./utils');
@@ -6,14 +10,16 @@ const { encodeShortCode, decodeShortCode, extractFirstUrl, isSupportedLink } = r
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 if (!BOT_TOKEN) throw new Error('Missing TELEGRAM_BOT_TOKEN in .env');
 
-const MY_PAGE_SIZE = 4;
+const MY_PAGE_SIZE = parseInt(process.env.MY_PAGE_SIZE || '4', 10);
 const LISTEN_PAGE_SIZE = parseInt(process.env.LISTEN_PAGE_SIZE || '15', 10);
+
+// Admin IDs CSV in env
 const ADMIN_IDS = (process.env.ADMIN_IDS || '').split(',').map(s => s.trim()).filter(Boolean).map(Number);
 const isAdmin = id => ADMIN_IDS.includes(Number(id));
 
 async function initBot() {
   const bot = new Telegraf(BOT_TOKEN);
-  const pending = new Map();
+  const pending = new Map(); // userId -> pending action
 
   function mainKeyboard() {
     return Markup.keyboard([
@@ -24,13 +30,14 @@ async function initBot() {
     ]).resize();
   }
 
+  // get live reaction counts
   async function getReactionCounts(commentId) {
     try {
       const types = ['heart', 'laugh', 'dislike'];
       const out = {};
       for (const t of types) {
-        const res = await db.supabase.from('voice_reactions').select('id', { head: true, count: 'exact' }).eq('comment_id', commentId).eq('type', t);
-        out[t] = (res && res.count) ? res.count : 0;
+        const r = await db.supabase.from('voice_reactions').select('id', { head: true, count: 'exact' }).eq('comment_id', commentId).eq('type', t);
+        out[t] = (r && r.count) ? r.count : 0;
       }
       return out;
     } catch (e) {
@@ -39,62 +46,44 @@ async function initBot() {
     }
   }
 
-  async function getReactionCountsForReply(replyId) {
+  // build actions keyboard and raw payload (so we can editMessageReplyMarkup easily)
+  async function buildActionsKeyboard(commentId, userId) {
     try {
-      const types = ['heart', 'laugh', 'dislike'];
-      const out = {};
-      for (const t of types) {
-        const res = await db.supabase.from('reply_reactions').select('id', { head: true, count: 'exact' }).eq('reply_id', replyId).eq('type', t);
-        out[t] = (res && res.count) ? res.count : 0;
+      const counts = await getReactionCounts(commentId);
+      let fav = false;
+      try {
+        fav = await db.isFavorite(userId, commentId);
+      } catch (e) {
+        // tolerate DB glitch
+        fav = false;
       }
-      return out;
+      const starLabel = fav ? '★ Favorite' : '☆ Favorite';
+      const inline = [
+        [
+          Markup.button.callback(`❤️ ${counts.heart}`, `react_${commentId}_heart`),
+          Markup.button.callback(`😂 ${counts.laugh}`, `react_${commentId}_laugh`),
+          Markup.button.callback(`👎 ${counts.dislike}`, `react_${commentId}_dislike`)
+        ],
+        [
+          Markup.button.callback(starLabel, `fav_${commentId}`),
+          Markup.button.callback('💬 Reply', `replymenu_${commentId}`),
+          Markup.button.callback('🗨 Replies', `list_replies_${commentId}`)
+        ],
+        [
+          Markup.button.callback('🚩 Report', `report_${commentId}`),
+          Markup.button.callback('🗑 Delete', `delete_comment_${commentId}`)
+        ]
+      ];
+      return { markup: Markup.inlineKeyboard(inline), raw: { inline_keyboard: inline.map(row => row.map(b => ({ text: b.text, callback_data: b.callback_data }))) } };
     } catch (e) {
-      console.error('getReactionCountsForReply', e);
-      return { heart: 0, laugh: 0, dislike: 0 };
+      console.error('buildActionsKeyboard error', e);
+      // fallback minimal keyboard
+      const inline = [[Markup.button.callback('💬 Reply', `replymenu_${commentId}`), Markup.button.callback('🗨 Replies', `list_replies_${commentId}`)]];
+      return { markup: Markup.inlineKeyboard(inline), raw: { inline_keyboard: inline.map(row => row.map(b => ({ text: b.text, callback_data: b.callback_data }))) } };
     }
   }
 
-  async function buildActionsKeyboard(commentId, userId) {
-    const counts = await getReactionCounts(commentId);
-    const fav = await db.isFavorite(userId, commentId);
-    const starLabel = fav ? '★ Favorite' : '☆ Favorite';
-    return Markup.inlineKeyboard([
-      [
-        Markup.button.callback(`❤️ ${counts.heart}`, `react_${commentId}_heart`),
-        Markup.button.callback(`😂 ${counts.laugh}`, `react_${commentId}_laugh`),
-        Markup.button.callback(`👎 ${counts.dislike}`, `react_${commentId}_dislike`)
-      ],
-      [
-        Markup.button.callback(starLabel, `fav_${commentId}`),
-        Markup.button.callback('▶️ Show replies', `show_replies_${commentId}`),
-        Markup.button.callback('💬 Reply', `replymenu_${commentId}`)
-      ],
-      [
-        Markup.button.callback('🚩 Report', `report_${commentId}`),
-        Markup.button.callback('🔗 Share code', `share_comment_${commentId}`),
-        Markup.button.callback('🗑 Delete', `delete_comment_${commentId}`)
-      ]
-    ]);
-  }
-
-  async function buildReplyActionsKeyboard(replyId, commentId, userId) {
-    const counts = await getReactionCountsForReply(replyId);
-    return Markup.inlineKeyboard([
-      [
-        Markup.button.callback('▶️ Play', `play_reply_${replyId}`),
-        Markup.button.callback(`❤️ ${counts.heart}`, `react_reply_${replyId}_heart`),
-        Markup.button.callback(`😂 ${counts.laugh}`, `react_reply_${replyId}_laugh`),
-        Markup.button.callback(`👎 ${counts.dislike}`, `react_reply_${replyId}_dislike`)
-      ],
-      [
-        Markup.button.callback('🚩 Report', `report_reply_${replyId}`),
-        Markup.button.callback('🔗 Share code', `share_reply_${replyId}`),
-        Markup.button.callback('↩️ Reply to reply', `replymenu_${commentId}`)
-      ]
-    ]);
-  }
-
-  // ---------- start ----------
+  // ---------------- START ----------------
   bot.start(async (ctx) => {
     try {
       await db.ensureUserRow(ctx.from);
@@ -103,7 +92,7 @@ async function initBot() {
       if (user) {
         await ctx.reply(`Hi ${name} — welcome back!\nFree comments: ${user.free_comments || 0}\nUnread replies: ${user.unread_replies_count || 0}`, mainKeyboard());
       } else {
-        await ctx.reply(`Hi ${name}! I'm Mr World Voice Comment Bot 🎙️\nSend a TikTok/YouTube link to create a thread or use 🔎 Search to find voices by code.`, mainKeyboard());
+        await ctx.reply(`Hi ${name}! I'm World Voice Comment Bot 🎙️\nSend a TikTok/YouTube link to create a thread or use 🔎 Search to find voices by code.`, mainKeyboard());
       }
     } catch (e) {
       console.error('/start error', e);
@@ -111,23 +100,7 @@ async function initBot() {
     }
   });
 
-  // favorites command
-  bot.command('favorites', async (ctx) => {
-    try {
-      const comments = await db.listFavoritesForUser(ctx.from.id);
-      if (!comments || comments.length === 0) return ctx.reply('No favorites yet.', mainKeyboard());
-      for (const c of comments) {
-        try { await ctx.replyWithVoice(c.telegram_file_id, { caption: `${c.first_name || c.username || 'User'}` }); } catch (e) {}
-        await ctx.reply(encodeShortCode(c.id));
-      }
-      return ctx.reply('End of favorites.', mainKeyboard());
-    } catch (e) {
-      console.error('/favorites', e);
-      return ctx.reply('Could not fetch favorites.', mainKeyboard());
-    }
-  });
-
-  // help, dashboard, search, notifications etc — keep similar behavior (unchanged)
+  // Help / dashboard / commands (kept compact)
   bot.command('help', (ctx) => ctx.reply(
     `/help — this menu
 🎥 Add Comment — create public thread
@@ -154,7 +127,23 @@ async function initBot() {
     }
   });
 
-  // search
+  // Favorites command
+  bot.command('favorites', async (ctx) => {
+    try {
+      const comments = await db.listFavoritesForUser(ctx.from.id);
+      if (!comments || comments.length === 0) return ctx.reply('No favorites yet.', mainKeyboard());
+      for (const c of comments) {
+        try { await ctx.replyWithVoice(c.telegram_file_id, { caption: `${c.first_name || c.username || 'User'}` }); } catch (e) {}
+        await ctx.reply(encodeShortCode(c.id));
+      }
+      return ctx.reply('End of favorites.', mainKeyboard());
+    } catch (e) {
+      console.error('/favorites', e);
+      return ctx.reply('Could not fetch favorites.', mainKeyboard());
+    }
+  });
+
+  // SEARCH flow
   bot.command('search', async (ctx) => {
     const parts = (ctx.message.text || '').split(/\s+/).slice(1);
     if (!parts.length) {
@@ -173,17 +162,17 @@ async function initBot() {
       const counts = await getReactionCounts(id);
       await ctx.replyWithVoice(comment.telegram_file_id, { caption: `${comment.first_name || comment.username || 'User'} • ${new Date(comment.created_at).toLocaleString()}` });
       await ctx.reply(encodeShortCode(comment.id));
-      const threadRow = await db.getThreadById(comment.thread_id);
+      const { data: threadRow } = await db.supabase.from('threads').select('social_link').eq('id', comment.thread_id).limit(1).maybeSingle();
       const videoLink = threadRow ? threadRow.social_link : '(video unknown)';
-      const actionsKb = await buildActionsKeyboard(comment.id, ctx.from.id);
-      await ctx.reply(`Stats: ❤️ ${counts.heart}  😂 ${counts.laugh}  👎 ${counts.dislike}\nVideo: ${videoLink}`, actionsKb);
+      const { markup } = await buildActionsKeyboard(comment.id, ctx.from.id);
+      await ctx.reply(`Stats: ❤️ ${counts.heart}  😂 ${counts.laugh}  👎 ${counts.dislike}\nVideo: ${videoLink}`, markup);
     } catch (e) {
       console.error('handleSearch', e);
       return ctx.reply('Search failed.', mainKeyboard());
     }
   }
 
-  // notifications
+  // Notifications list
   bot.command('notifications', async (ctx) => {
     try {
       const { data } = await db.listNotifications(ctx.from.id);
@@ -195,7 +184,7 @@ async function initBot() {
           if (meta.comment_id) {
             const counts = await getReactionCounts(meta.comment_id);
             const comment = await db.getCommentById(meta.comment_id);
-            const threadRow = comment ? await db.getThreadById(comment.thread_id) : null;
+            const { data: threadRow } = await db.supabase.from('threads').select('social_link').eq('id', comment.thread_id).limit(1).maybeSingle();
             const videoLink = threadRow ? threadRow.social_link : '(video unknown)';
             text = `${encodeShortCode(meta.comment_id)} — Stats: ❤️ ${counts.heart}  😂 ${counts.laugh}  👎 ${counts.dislike}\nVideo: ${videoLink}\n${n.message}`;
           }
@@ -219,7 +208,7 @@ async function initBot() {
     }
   });
 
-  // my comments (paginated)
+  // My comments (paginated MY_PAGE_SIZE)
   bot.command('my', async (ctx) => sendMyCommentsPage(ctx, 1));
   async function sendMyCommentsPage(ctx, page = 1) {
     try {
@@ -232,8 +221,8 @@ async function initBot() {
       for (const c of comments) {
         try { await ctx.replyWithVoice(c.telegram_file_id, { caption: `${c.first_name || c.username || 'User'} • ${new Date(c.created_at).toLocaleString()}` }); } catch (e) {}
         await ctx.reply(encodeShortCode(c.id));
-        const actionsKb = await buildActionsKeyboard(c.id, ctx.from.id);
-        await ctx.reply('Actions:', actionsKb);
+        const { markup } = await buildActionsKeyboard(c.id, ctx.from.id);
+        await ctx.reply('Actions:', markup);
       }
       const shown = Math.min(offset + comments.length, total);
       if (shown < total) {
@@ -247,19 +236,19 @@ async function initBot() {
     }
   }
 
-  // ---------- text handler ----------
+  // TEXT messages handler
   bot.on('text', async (ctx) => {
     const text = (ctx.message && ctx.message.text) || '';
     const uid = ctx.from.id;
     const p = pending.get(uid);
 
-    // search continuation
+    // Search continuation
     if (p && p.type === 'search_prompt') {
       pending.delete(uid);
       return handleSearch(ctx, text.trim());
     }
 
-    // reply text continuation
+    // Reply text continuation
     if (p && p.type === 'reply_text') {
       const commentId = p.commentId;
       pending.delete(uid);
@@ -273,21 +262,25 @@ async function initBot() {
         };
         const { data, error } = await db.insertReplyRow(payload);
         if (error) throw error;
+
+        // public post (text)
         await ctx.reply(`↳ ${ctx.from.first_name || ctx.from.username || 'User'}: ${text}`);
 
-        // notify owner (compact), include audio when reply has it (this is a text reply, so no audio to include)
+        // notify owner (compact + include audio when present — text replies won't include audio)
         try {
           const comment = await db.getCommentById(commentId);
           if (comment && comment.telegram_id && comment.telegram_id !== ctx.from.id) {
             const short = encodeShortCode(commentId);
             const counts = await getReactionCounts(commentId);
-            const threadRow = comment ? await db.getThreadById(comment.thread_id) : null;
+            const { data: threadRow } = await db.supabase.from('threads').select('social_link').eq('id', comment.thread_id).limit(1).maybeSingle();
             const videoLink = threadRow ? threadRow.social_link : '(video unknown)';
             const msg = `${ctx.from.first_name || ctx.from.username} replied to your comment.\n${short}\nStats: ❤️ ${counts.heart}  😂 ${counts.laugh}  👎 ${counts.dislike}\nVideo: ${videoLink}`;
-            await db.addNotificationRow({ telegram_id: comment.telegram_id, type: 'reply', message: msg, meta: { comment_id: commentId, reply_id: data?.id ?? null } });
+            await db.addNotificationRow({ telegram_id: comment.telegram_id, type: 'reply', message: msg, meta: { comment_id: commentId } });
             try { await bot.telegram.sendMessage(comment.telegram_id, `${short}\n${msg}`); } catch (_) {}
           }
-        } catch (e) { console.error('notify owner on text reply', e); }
+        } catch (e) {
+          console.error('notify owner on text reply', e);
+        }
 
         return ctx.reply('Reply saved and posted publicly.', mainKeyboard());
       } catch (e) {
@@ -296,7 +289,7 @@ async function initBot() {
       }
     }
 
-    // keyboard text flows
+    // Keyboard shortcuts:
     if (text === '🎥 Add Comment') {
       pending.set(uid, { type: 'create_thread_public' });
       return ctx.reply('🎥 Send me the TikTok/YouTube link and you can add a voice comment for it.', mainKeyboard());
@@ -329,14 +322,14 @@ async function initBot() {
       return sendMyCommentsPage(ctx, 1);
     }
     if (text === '⭐ Favorites') {
-      return bot.handleUpdate(ctx.update); // fallback to ensure favorites command triggers - usually handled by bot.command('favorites')
+      return bot.command('favorites')(ctx);
     }
     if (text === '🔎 Search') {
       pending.set(uid, { type: 'search_prompt' });
       return ctx.reply('🔎 Send the short code (e.g. 0000A9) or use /search CODE.', mainKeyboard());
     }
 
-    // thread creation flows
+    // Create thread continuation
     if (p && (p.type === 'create_thread_public' || p.type === 'create_thread_owned')) {
       const url = extractFirstUrl(text);
       if (!url) return ctx.reply('I could not find a link. Send a TikTok/YouTube URL.', mainKeyboard());
@@ -355,7 +348,7 @@ async function initBot() {
       }
     }
 
-    // direct link -> create public thread
+    // Direct link (quick-create)
     if (isSupportedLink(text) || extractFirstUrl(text)) {
       const url = extractFirstUrl(text);
       try {
@@ -371,7 +364,7 @@ async function initBot() {
       }
     }
 
-    // admin actions and reports (unchanged)
+    // Admin / delete / report flows (text commands)
     if (text.startsWith('/admin_delete_comment')) {
       if (!isAdmin(ctx.from.id)) return ctx.reply('You are not an admin.');
       const parts = text.split(/\s+/).slice(1);
@@ -424,24 +417,24 @@ async function initBot() {
       }
     }
 
+    // fallback
     return ctx.reply(`Hi ${ctx.from.first_name || ''}! I didn't detect a supported link. Press a button or send a TikTok/YouTube URL.`, mainKeyboard());
   });
 
-  // ---------- callback queries ----------
+  // CALLBACKS
   bot.on('callback_query', async (ctx) => {
     const data = ctx.callbackQuery && ctx.callbackQuery.data;
     const uid = ctx.from.id;
     if (!data) return ctx.answerCbQuery();
-
     try {
-      // pagination for "my"
+      // my pagination
       if (data.startsWith('my_')) {
         const page = Number(data.split('_')[1]) || 1;
         await sendMyCommentsPage(ctx, page);
         return ctx.answerCbQuery();
       }
 
-      // add voice
+      // add voice to thread
       if (data.startsWith('addvoice_')) {
         const threadId = Number(data.split('_')[1]);
         pending.set(uid, { type: 'add_comment', threadId });
@@ -449,7 +442,7 @@ async function initBot() {
         return ctx.reply('🎙 Send your voice message now; it will attach to that thread.');
       }
 
-      // listen - IMPORTANT: show only main comments (no replies inline)
+      // listen comments (paginated)
       if (data.startsWith('listen_')) {
         const [ , threadIdStr, pageStr ] = data.split('_');
         const threadId = Number(threadIdStr);
@@ -458,16 +451,30 @@ async function initBot() {
         const { data: comments, error } = await db.listCommentsByThread(threadId, offset, LISTEN_PAGE_SIZE);
         if (error) { console.error('listen error', error); await ctx.answerCbQuery('Could not fetch'); return; }
         if (!comments || comments.length === 0) { await ctx.answerCbQuery(); return ctx.reply('No comments yet.'); }
-
         for (const c of comments) {
-          const caption = `${c.first_name || c.username || 'User'} • ${new Date(c.created_at).toLocaleString()}`;
-          try { await ctx.replyWithVoice(c.telegram_file_id, { caption }); } catch (e) { console.error('send voice', e); }
+          // send main voice
+          try { await ctx.replyWithVoice(c.telegram_file_id, { caption: `${c.first_name || c.username || 'User'} • ${new Date(c.created_at).toLocaleString()}` }); } catch (e) {}
+
+          // single-token code
           await ctx.reply(encodeShortCode(c.id));
-          // actions: reactions + Show replies button (no inline replies)
-          const actionsKb = await buildActionsKeyboard(c.id, ctx.from.id);
-          await ctx.reply('Actions:', actionsKb);
+
+          // Do NOT show full replies inline here — only a small preview and "See replies" button
+          const { data: replies } = await db.supabase
+            .from('voice_replies')
+            .select('*')
+            .eq('comment_id', c.id)
+            .order('created_at', { ascending: true });
+          if (replies && replies.length > 0) {
+            // show a tiny preview count and a "See replies" button
+            await ctx.reply(`↳ ${replies.length} replies`, Markup.inlineKeyboard([[Markup.button.callback('🗨 See replies', `list_replies_${c.id}`)]]));
+          }
+
+          // actions compact
+          const { markup } = await buildActionsKeyboard(c.id, ctx.from.id);
+          await ctx.reply('Actions:', markup);
         }
 
+        // pagination more:
         const countRes = await db.supabase.from('voice_comments').select('id', { head: true, count: 'exact' }).eq('thread_id', threadId);
         const total = countRes && countRes.count ? countRes.count : 0;
         if (offset + comments.length < total) {
@@ -476,85 +483,7 @@ async function initBot() {
         return ctx.answerCbQuery();
       }
 
-      // show_replies (only when user requests)
-      if (data.startsWith('show_replies_')) {
-        const commentId = Number(data.split('_')[2]);
-        const { data: replies, error } = await db.listRepliesByComment(commentId);
-        if (error) { console.error('listReplies error', error); await ctx.answerCbQuery('Could not fetch replies'); return; }
-        if (!replies || replies.length === 0) { await ctx.answerCbQuery(); return ctx.reply('No replies yet.'); }
-        await ctx.answerCbQuery();
-        for (const r of replies) {
-          const who = r.replier_first_name || r.replier_username || 'User';
-          const when = new Date(r.created_at).toLocaleString();
-          if (r.telegram_file_id) {
-            await ctx.reply(`${who} • ${when} — voice reply`);
-            try {
-              const actionsKb = await buildReplyActionsKeyboard(r.id, commentId, ctx.from.id);
-              // We send the voice then actions. For a nicer compact view you could send <caption> in voice, but some clients hide inline keyboard on voice; both ways are acceptable.
-              await ctx.replyWithVoice(r.telegram_file_id, { caption: `${who} • ${when}` });
-              await ctx.reply('Reply actions:', actionsKb);
-            } catch (e) { console.error('send reply voice', e); }
-          } else if (r.telegram_photo_id) {
-            try {
-              await ctx.replyWithPhoto(r.telegram_photo_id, { caption: `${who} • ${when} — photo reply` });
-              const actionsKb = await buildReplyActionsKeyboard(r.id, commentId, ctx.from.id);
-              await ctx.reply('Reply actions:', actionsKb);
-            } catch (e) { console.error('send reply photo', e); }
-          } else if (r.reply_text) {
-            try {
-              const actionsKb = await buildReplyActionsKeyboard(r.id, commentId, ctx.from.id);
-              await ctx.reply(`↳ ${who} • ${when}: ${r.reply_text}`, actionsKb);
-            } catch (e) { console.error('send reply text', e); }
-          } else {
-            await ctx.reply(`↳ ${who} • ${when}: (empty reply)`);
-          }
-        }
-        return;
-      }
-
-      // play reply audio (in case we want a separate play action)
-      if (data.startsWith('play_reply_')) {
-        const replyId = Number(data.split('_')[2]);
-        const reply = await db.getReplyById(replyId);
-        if (!reply) return ctx.answerCbQuery('Reply not found');
-        if (reply.telegram_file_id) {
-          await ctx.answerCbQuery();
-          try { await ctx.replyWithVoice(reply.telegram_file_id, { caption: `${reply.replier_first_name || reply.replier_username || 'User'} • ${new Date(reply.created_at).toLocaleString()}` }); } catch (e) { console.error('play reply', e); return ctx.answerCbQuery('Could not play'); }
-        } else {
-          return ctx.answerCbQuery('No audio for that reply');
-        }
-        return;
-      }
-
-      // reply-level reactions
-      if (data.startsWith('react_reply_')) {
-        const parts = data.split('_'); // react_reply_<replyId>_<type>
-        const replyId = Number(parts[2]);
-        const type = parts[3];
-        const allowed = new Set(['heart','laugh','dislike']);
-        if (!allowed.has(type)) return ctx.answerCbQuery('Unknown reaction');
-        const { data: inserted, error } = await db.insertReplyReactionRow({ reply_id: replyId, user_id: ctx.from.id, type });
-        if (error) { console.error('insertReplyReactionRow', error); return ctx.answerCbQuery('DB error'); }
-
-        // notify reply owner compactly (include code + video link)
-        try {
-          const reply = await db.getReplyById(replyId);
-          if (reply && reply.replier_telegram_id && reply.replier_telegram_id !== ctx.from.id) {
-            const counts = await getReactionCountsForReply(replyId);
-            const comment = await db.getCommentById(reply.comment_id);
-            const threadRow = comment ? await db.getThreadById(comment.thread_id) : null;
-            const videoLink = threadRow ? threadRow.social_link : '(video unknown)';
-            const short = encodeShortCode(replyId);
-            const msgText = `${ctx.from.first_name || ctx.from.username || 'Someone'} reacted (${type}) to your reply.\nReply code: ${short}\nStats: ❤️ ${counts.heart}  😂 ${counts.laugh}  👎 ${counts.dislike}\nVideo: ${videoLink}`;
-            await db.addNotificationRow({ telegram_id: reply.replier_telegram_id, type: 'reply_reaction', message: msgText, meta: { reply_id: replyId, comment_id: reply.comment_id } });
-            try { await bot.telegram.sendMessage(reply.replier_telegram_id, `${short}\n${msgText}`); } catch (_) {}
-          }
-        } catch (e) { console.error('notify reply owner', e); }
-
-        return ctx.answerCbQuery('Reaction saved.');
-      }
-
-      // comment-level reactions
+      // reaction handler
       if (data.startsWith('react_')) {
         const [, idStr, type] = data.split('_');
         const commentId = Number(idStr);
@@ -563,28 +492,30 @@ async function initBot() {
         const { data: reactionData, error } = await db.insertReactionRow({ comment_id: commentId, user_id: ctx.from.id, type });
         if (error) { console.error('insertReactionRow', error); return ctx.answerCbQuery('DB error'); }
 
-        // update markup if possible
+        // update keyboard counts if possible
         try {
           const msg = ctx.callbackQuery.message;
           if (msg && msg.chat && msg.message_id) {
-            const newKb = await buildActionsKeyboard(commentId, ctx.from.id);
-            try { await ctx.telegram.editMessageReplyMarkup(msg.chat.id, msg.message_id, null, newKb.reply_markup); } catch (e) { /* ignore edit errors */ }
+            const { raw } = await buildActionsKeyboard(commentId, ctx.from.id);
+            try { await ctx.telegram.editMessageReplyMarkup(msg.chat.id, msg.message_id, null, raw); } catch (e) { /* ignore edit errors */ }
           }
         } catch (e) { console.error('edit keyboard error', e); }
 
-        // notify comment owner compactly
+        // notify owner compactly (no voice here)
         try {
           const comment = await db.getCommentById(commentId);
           if (comment && comment.telegram_id && comment.telegram_id !== ctx.from.id) {
             const short = encodeShortCode(commentId);
             const counts2 = await getReactionCounts(commentId);
-            const threadRow = comment ? await db.getThreadById(comment.thread_id) : null;
+            const { data: threadRow } = await db.supabase.from('threads').select('social_link').eq('id', comment.thread_id).limit(1).maybeSingle();
             const videoLink = threadRow ? threadRow.social_link : '(video unknown)';
             const msgText = `${ctx.from.first_name || ctx.from.username || 'Someone'} reacted (${type}) to your comment.\n${short}\nStats: ❤️ ${counts2.heart}  😂 ${counts2.laugh}  👎 ${counts2.dislike}\nVideo: ${videoLink}`;
             await db.addNotificationRow({ telegram_id: comment.telegram_id, type: 'reaction', message: msgText, meta: { comment_id: commentId } });
             try { await bot.telegram.sendMessage(comment.telegram_id, `${short}\n${msgText}`); } catch (_) {}
           }
-        } catch (e) { console.error('notify owner on reaction', e); }
+        } catch (e) {
+          console.error('notify owner on reaction', e);
+        }
 
         return ctx.answerCbQuery('Reaction saved.');
       }
@@ -596,8 +527,8 @@ async function initBot() {
           const r = await db.toggleFavoriteRow(ctx.from.id, commentId);
           const msg = ctx.callbackQuery.message;
           if (msg && msg.chat && msg.message_id) {
-            const newKb = await buildActionsKeyboard(commentId, ctx.from.id);
-            try { await ctx.telegram.editMessageReplyMarkup(msg.chat.id, msg.message_id, null, newKb.reply_markup); } catch (e) { /* ignore */ }
+            const { raw } = await buildActionsKeyboard(commentId, ctx.from.id);
+            try { await ctx.telegram.editMessageReplyMarkup(msg.chat.id, msg.message_id, null, raw); } catch (e) { /* ignore edit errors */ }
           }
           return ctx.answerCbQuery(r.removed ? 'Favorite removed' : 'Favorite added');
         } catch (e) {
@@ -606,7 +537,7 @@ async function initBot() {
         }
       }
 
-      // reply menu start
+      // reply menu: set pending so next media/text is treated as reply
       if (data.startsWith('replymenu_')) {
         const commentId = Number(data.split('_')[1]);
         pending.set(ctx.from.id, { type: 'reply_choice', commentId });
@@ -614,13 +545,15 @@ async function initBot() {
         return ctx.reply('Reply options:\n• Send voice now to add voice reply\n• Send text now to add text reply\n• Send photo now to add photo reply\n(Your next message or media will be treated as the reply.)');
       }
 
-      // reply text/voice quick starts (optional inline)
+      // reply text starter
       if (data.startsWith('replytext_')) {
         const commentId = Number(data.split('_')[1]);
         pending.set(ctx.from.id, { type: 'reply_text', commentId });
         await ctx.answerCbQuery('Send reply text now');
         return ctx.reply('✍️ Send your reply text now.');
       }
+
+      // reply voice starter
       if (data.startsWith('replyvoice_')) {
         const commentId = Number(data.split('_')[1]);
         pending.set(ctx.from.id, { type: 'reply_voice', commentId });
@@ -628,10 +561,10 @@ async function initBot() {
         return ctx.reply('🎙 Send your voice reply now.');
       }
 
-      // list replies (full list) - kept for compatibility
+      // list replies (public)
       if (data.startsWith('list_replies_')) {
         const commentId = Number(data.split('_')[1]);
-        const { data: replies } = await db.listRepliesByComment(commentId);
+        const { data: replies } = await db.supabase.from('voice_replies').select('*').eq('comment_id', commentId).order('created_at', { ascending: true });
         if (!replies || replies.length === 0) { await ctx.answerCbQuery(); return ctx.reply('No replies yet.'); }
         await ctx.answerCbQuery();
         for (const r of replies) {
@@ -646,7 +579,7 @@ async function initBot() {
         return;
       }
 
-      // report comment
+      // report inline
       if (data.startsWith('report_')) {
         const commentId = Number(data.split('_')[1]);
         await db.supabase.from('reports').insert([{ reporter_telegram_id: ctx.from.id, comment_id: commentId, reason: null }]);
@@ -656,17 +589,7 @@ async function initBot() {
         return ctx.answerCbQuery('Reported. Admins notified.');
       }
 
-      // report reply
-      if (data.startsWith('report_reply_')) {
-        const replyId = Number(data.split('_')[2]);
-        await db.supabase.from('reports').insert([{ reporter_telegram_id: ctx.from.id, reply_id: replyId, reason: null }]);
-        for (const adm of ADMIN_IDS) {
-          try { await bot.telegram.sendMessage(adm, `🚨 Report: ${ctx.from.first_name || ctx.from.username} reported reply ${encodeShortCode(replyId)}`); } catch (_) {}
-        }
-        return ctx.answerCbQuery('Reported. Admins notified.');
-      }
-
-      // delete comment inline
+      // delete inline
       if (data.startsWith('delete_comment_')) {
         const commentId = Number(data.split('_')[1]);
         const { data: comment } = await db.supabase.from('voice_comments').select('*').eq('id', commentId).limit(1).maybeSingle();
@@ -676,20 +599,6 @@ async function initBot() {
         return ctx.answerCbQuery('Deleted.');
       }
 
-      // share comment code
-      if (data.startsWith('share_comment_')) {
-        const commentId = Number(data.split('_')[2]);
-        await ctx.answerCbQuery();
-        return ctx.reply(encodeShortCode(commentId));
-      }
-
-      // share reply code
-      if (data.startsWith('share_reply_')) {
-        const replyId = Number(data.split('_')[2]);
-        await ctx.answerCbQuery();
-        return ctx.reply(encodeShortCode(replyId));
-      }
-
       await ctx.answerCbQuery();
     } catch (e) {
       console.error('callback_query handler', e);
@@ -697,12 +606,12 @@ async function initBot() {
     }
   });
 
-  // ---------- voice handler ----------
+  // VOICE handler (reply or add comment)
   bot.on('voice', async (ctx) => {
     const uid = ctx.from.id;
     const p = pending.get(uid);
 
-    // reply voice continuation
+    // reply voice continuation (if pending reply_choice or reply_voice)
     if (p && (p.type === 'reply_voice' || (p.type === 'reply_choice' && p.commentId))) {
       const commentId = p.commentId;
       pending.delete(uid);
@@ -718,27 +627,28 @@ async function initBot() {
         const { data, error } = await db.insertReplyRow(payload);
         if (error) throw error;
 
+        // public post of reply voice
         await ctx.replyWithVoice(voice.file_id, { caption: `↳ Reply by ${ctx.from.first_name || ctx.from.username}` });
 
-        // notify comment owner and include audio in notification when possible
+        // notify owner and include audio in notification when possible
         try {
           const comment = await db.getCommentById(commentId);
           if (comment && comment.telegram_id && comment.telegram_id !== ctx.from.id) {
             const short = encodeShortCode(commentId);
             const counts = await getReactionCounts(commentId);
-            const tr = await db.getThreadById(comment.thread_id);
+            const tr = await db.supabase.from('threads').select('social_link').eq('id', comment.thread_id).limit(1).maybeSingle();
             const videoLink = tr ? tr.social_link : '(video unknown)';
             const msg = `${ctx.from.first_name || ctx.from.username} replied to your comment.\n${short}\nStats: ❤️ ${counts.heart}  😂 ${counts.laugh}  👎 ${counts.dislike}\nVideo: ${videoLink}`;
-            await db.addNotificationRow({ telegram_id: comment.telegram_id, type: 'reply', message: msg, meta: { comment_id: commentId, reply_id: data?.id ?? null } });
+            await db.addNotificationRow({ telegram_id: comment.telegram_id, type: 'reply', message: msg, meta: { comment_id: commentId } });
             if (data && data.telegram_file_id) {
               try {
-                await bot.telegram.sendVoice(comment.telegram_id, data.telegram_file_id, { caption: `${encodeShortCode(data.id)} — reply to ${short}\n${msg}` });
+                await bot.telegram.sendVoice(comment.telegram_id, data.telegram_file_id, { caption: `${short}\n${msg}` });
               } catch (err) {
                 console.error('Failed to send reply voice to owner:', err);
-                try { await bot.telegram.sendMessage(comment.telegram_id, `${encodeShortCode(data.id)}\n${msg}`); } catch (_) {}
+                try { await bot.telegram.sendMessage(comment.telegram_id, `${short}\n${msg}`); } catch (_) {}
               }
             } else {
-              try { await bot.telegram.sendMessage(comment.telegram_id, `${encodeShortCode(data?.id ?? 0)}\n${msg}`); } catch (_) {}
+              try { await bot.telegram.sendMessage(comment.telegram_id, `${short}\n${msg}`); } catch (_) {}
             }
           }
         } catch (e) { console.error('notify owner reply voice', e); }
@@ -750,7 +660,7 @@ async function initBot() {
       }
     }
 
-    // add comment voice flow
+    // add comment flow
     if (!p || p.type !== 'add_comment') {
       return ctx.reply('No pending add-comment action. Click "Add Voice Comment" first.', mainKeyboard());
     }
@@ -777,7 +687,7 @@ async function initBot() {
       await ctx.reply('✅ Voice saved!');
       await ctx.reply(short);
 
-      // notify thread owner if they are tracker (compact)
+      // notify thread owner if tracking
       if (thread.creator_telegram_id && thread.creator_telegram_id !== ctx.from.id) {
         const notif = `🔔 New voice comment on your tracked video by ${ctx.from.first_name || ctx.from.username}\nVideo: ${thread.social_link}\nCode: ${short}`;
         await db.addNotificationRow({ telegram_id: thread.creator_telegram_id, type: 'reply', message: notif, meta: { thread_id: threadId, comment_id: data.id } });
@@ -791,7 +701,7 @@ async function initBot() {
     }
   });
 
-  // photo handler for photo-replies
+  // Photo reply handler
   bot.on('photo', async (ctx) => {
     const uid = ctx.from.id;
     const p = pending.get(uid);
@@ -815,16 +725,17 @@ async function initBot() {
 
       await ctx.replyWithPhoto(photo.file_id, { caption: `↳ Photo reply by ${ctx.from.first_name || ctx.from.username}` });
 
+      // notify owner compact
       try {
         const comment = await db.getCommentById(p.commentId);
         if (comment && comment.telegram_id && comment.telegram_id !== ctx.from.id) {
           const short = encodeShortCode(p.commentId);
           const counts = await getReactionCounts(p.commentId);
-          const tr = await db.getThreadById(comment.thread_id);
+          const { data: tr } = await db.supabase.from('threads').select('social_link').eq('id', comment.thread_id).limit(1).maybeSingle();
           const videoLink = tr ? tr.social_link : '(video unknown)';
           const msg = `${ctx.from.first_name || ctx.from.username} replied to your comment with a photo.\n${short}\nStats: ❤️ ${counts.heart}  😂 ${counts.laugh}  👎 ${counts.dislike}\nVideo: ${videoLink}`;
-          await db.addNotificationRow({ telegram_id: comment.telegram_id, type: 'reply', message: msg, meta: { comment_id: p.commentId, reply_id: data?.id ?? null } });
-          try { await bot.telegram.sendMessage(comment.telegram_id, `${encodeShortCode(data?.id ?? 0)}\n${msg}`); } catch (_) {}
+          await db.addNotificationRow({ telegram_id: comment.telegram_id, type: 'reply', message: msg, meta: { comment_id: p.commentId } });
+          try { await bot.telegram.sendMessage(comment.telegram_id, `${short}\n${msg}`); } catch (_) {}
         }
       } catch (e) { console.error('notify owner photo reply', e); }
 
@@ -835,24 +746,27 @@ async function initBot() {
     }
   });
 
-  // message fallback for reply_choice -> text
+  // If user was in reply_choice and sends text, convert to reply_text
   bot.on('message', async (ctx) => {
     const p = pending.get(ctx.from.id);
     if (p && p.type === 'reply_choice' && ctx.message && ctx.message.text) {
       pending.set(ctx.from.id, { type: 'reply_text', commentId: p.commentId });
+      // Let text handler above pick it up on next cycle
       return;
     }
   });
 
-  // weekly_top (kept)
+  // weekly_top simple aggregation (only fetch reactions in last 7 days to avoid large table scans)
   bot.command('weekly_top', async (ctx) => {
     try {
-      const raw = await db.supabase.from('voice_reactions').select('comment_id,created_at');
+      const cutoffISO = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
+      // fetch only recent reactions
+      const raw = await db.supabase.from('voice_reactions').select('comment_id').gte('created_at', cutoffISO);
       const rows = raw.data || [];
-      const cutoff = Date.now() - 7*24*3600*1000;
       const agg = {};
       rows.forEach(r => {
-        if (new Date(r.created_at).getTime() >= cutoff) agg[r.comment_id] = (agg[r.comment_id]||0)+1;
+        if (!r || !r.comment_id) return;
+        agg[r.comment_id] = (agg[r.comment_id]||0)+1;
       });
       const arr = Object.keys(agg).map(k => ({ comment_id: Number(k), cnt: agg[k] }));
       arr.sort((a,b)=>b.cnt-a.cnt);
