@@ -1,148 +1,296 @@
-// src/database.js
+// path: src/database.js
+// Lazy Supabase client wrapper and DB functions.
+// Safe to require even when env vars are missing.
+
 const { createClient } = require('@supabase/supabase-js');
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_KEY;
+let supabase = null;
+let adminNotifier = null; // function (message) => Promise<void>
 
-if (!SUPABASE_URL || !SUPABASE_KEY) {
-  throw new Error('Supabase env vars missing: SUPABASE_URL, SUPABASE_KEY. Add them to your .env or env on host.');
+function initSupabase() {
+  if (supabase) return supabase;
+  const url = process.env.SUPABASE_URL || null;
+  const key = process.env.SUPABASE_KEY || null;
+  if (!url || !key) {
+    // Return a minimal fake client to avoid crashes; real calls will throw when attempted.
+    console.warn('[db] SUPABASE not configured — DB functions will fail until SUPABASE_URL and SUPABASE_KEY are set.');
+    supabase = {
+      from: () => ({ select: async () => { throw new Error('SUPABASE_NOT_CONFIGURED'); } })
+    };
+    return supabase;
+  }
+  supabase = createClient(url, key, { auth: { persistSession: false } });
+  return supabase;
 }
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
-
-// ensure user row exists (upsert)
-async function ensureUserRow(telegramUser) {
-  if (!telegramUser || !telegramUser.id) throw new Error('telegramUser missing');
-  const payload = {
-    telegram_id: telegramUser.id,
-    username: telegramUser.username ?? null,
-    first_name: telegramUser.first_name ?? null
-  };
-  const { error } = await supabase.from('users').upsert([payload], { onConflict: 'telegram_id' });
-  if (error) throw error;
-  return true;
+function setAdminNotifier(fn) {
+  adminNotifier = fn;
 }
 
-async function createThread(social_link, creator_telegram_id = null) {
-  const { data: existing } = await supabase.from('threads').select('*').eq('social_link', social_link).limit(1).maybeSingle();
-  if (existing) return existing;
-  const payload = { social_link };
-  if (creator_telegram_id) payload.creator_telegram_id = creator_telegram_id;
-  const { data, error } = await supabase.from('threads').insert([payload]).select().maybeSingle();
-  if (error) throw error;
-  return data;
+async function notifyAdmins(message, meta = {}) {
+  try {
+    // Insert into notifications table
+    const db = initSupabase();
+    if (db && db.from) {
+      await db.from('notifications').insert({
+        telegram_id: null,
+        type: 'admin',
+        message: message,
+        meta
+      });
+    }
+  } catch (err) {
+    console.error('[db] Failed to insert notification:', err?.message || err);
+  }
+
+  if (adminNotifier) {
+    try {
+      await adminNotifier(String(message).slice(0, 4000));
+    } catch (err) {
+      console.error('[db] adminNotifier failed:', err?.message || err);
+    }
+  } else {
+    console.log('[db] adminNotifier not set; message:', message);
+  }
 }
 
-async function getThreadByLink(link) {
-  const { data } = await supabase.from('threads').select('*').eq('social_link', link).limit(1).maybeSingle();
-  return data || null;
+// USER helpers
+async function ensureUser(telegramUser = {}) {
+  const db = initSupabase();
+  if (!db || !db.from) throw new Error('SUPABASE_NOT_CONFIGURED');
+  const telegram_id = telegramUser.id;
+  try {
+    const { data: existing } = await db.from('users').select('*').eq('telegram_id', telegram_id).limit(1);
+    if (existing && existing.length) {
+      // update username/first_name if changed
+      const user = existing[0];
+      if (user.username !== (telegramUser.username || null) || user.first_name !== (telegramUser.first_name || null)) {
+        await db.from('users').update({
+          username: telegramUser.username || null,
+          first_name: telegramUser.first_name || null
+        }).eq('telegram_id', telegram_id);
+      }
+      return user;
+    } else {
+      const toInsert = {
+        telegram_id,
+        username: telegramUser.username || null,
+        first_name: telegramUser.first_name || null,
+        free_comments: 0
+      };
+      const { data } = await db.from('users').insert(toInsert).select().single();
+      return data;
+    }
+  } catch (err) {
+    console.error('[db] ensureUser error:', err?.message || err);
+    await notifyAdmins(`[DB ERROR] ensureUser failed: ${err?.message}`, { user: telegramUser });
+    throw err;
+  }
 }
 
-async function insertVoiceComment(payload) {
-  // payload: { thread_id, telegram_id, username, first_name, telegram_file_id, duration }
-  const { data, error } = await supabase.from('voice_comments').insert([payload]).select().maybeSingle();
-  return { data, error };
+// THREAD helpers
+async function findOrCreateThread(social_link, creator_telegram_id = null, normalized_link = null) {
+  const db = initSupabase();
+  if (!db || !db.from) throw new Error('SUPABASE_NOT_CONFIGURED');
+  try {
+    const { data: found } = await db.from('threads').select('*').eq('social_link', social_link).limit(1);
+    if (found && found.length) return found[0];
+    const { data } = await db.from('threads').insert({
+      social_link,
+      creator_telegram_id,
+      normalized_link
+    }).select().single();
+    return data;
+  } catch (err) {
+    console.error('[db] findOrCreateThread error:', err?.message || err);
+    await notifyAdmins(`[DB ERROR] findOrCreateThread failed: ${err?.message}`, { social_link });
+    throw err;
+  }
 }
 
-async function listCommentsByThread(threadId, offset = 0, limit = 15) {
-  const from = offset;
-  const to = offset + limit - 1;
-  const { data, error } = await supabase.from('voice_comments')
-    .select('*')
-    .eq('thread_id', threadId)
-    .order('created_at', { ascending: true })
-    .range(from, to);
-  return { data, error };
+// COMMENTS
+async function addVoiceComment({ thread_id, telegram_id, username, first_name, telegram_file_id, duration }) {
+  const db = initSupabase();
+  if (!db || !db.from) throw new Error('SUPABASE_NOT_CONFIGURED');
+  try {
+    const { data } = await db.from('voice_comments').insert({
+      thread_id,
+      telegram_id,
+      username: username || null,
+      first_name: first_name || null,
+      telegram_file_id,
+      duration
+    }).select().single();
+    return data;
+  } catch (err) {
+    console.error('[db] addVoiceComment error:', err?.message || err);
+    await notifyAdmins(`[DB ERROR] addVoiceComment failed: ${err?.message}`, { thread_id, telegram_id });
+    throw err;
+  }
+}
+
+async function listCommentsForThread(thread_id, limit = 15, offset = 0) {
+  const db = initSupabase();
+  if (!db || !db.from) throw new Error('SUPABASE_NOT_CONFIGURED');
+  try {
+    const { data } = await db.from('voice_comments')
+      .select('*')
+      .eq('thread_id', thread_id)
+      .order('created_at', { ascending: false })
+      .limit(limit)
+      .offset(offset);
+    return data || [];
+  } catch (err) {
+    console.error('[db] listCommentsForThread error:', err?.message || err);
+    await notifyAdmins(`[DB ERROR] listCommentsForThread failed: ${err?.message}`, { thread_id });
+    throw err;
+  }
 }
 
 async function getCommentById(id) {
-  const { data } = await supabase.from('voice_comments').select('*').eq('id', id).limit(1).maybeSingle();
-  return data || null;
+  const db = initSupabase();
+  if (!db || !db.from) throw new Error('SUPABASE_NOT_CONFIGURED');
+  const { data } = await db.from('voice_comments').select('*').eq('id', id).limit(1);
+  return data && data[0] ? data[0] : null;
 }
 
-async function insertReplyRow(payload) {
-  // payload: { comment_id, replier_telegram_id, replier_username, replier_first_name, telegram_file_id?, telegram_photo_id?, reply_text? }
-  const { data, error } = await supabase.from('voice_replies').insert([payload]).select().maybeSingle();
-  return { data, error };
+// REPLIES
+async function addReply({ comment_id, replier_telegram_id, replier_username, replier_first_name, reply_text = null, reply_photo_url = null, telegram_file_id = null }) {
+  const db = initSupabase();
+  if (!db || !db.from) throw new Error('SUPABASE_NOT_CONFIGURED');
+  try {
+    const { data } = await db.from('replies').insert({
+      comment_id,
+      replier_telegram_id,
+      replier_username: replier_username || null,
+      replier_first_name: replier_first_name || null,
+      reply_text,
+      reply_photo_url,
+      telegram_file_id
+    }).select().single();
+    return data;
+  } catch (err) {
+    console.error('[db] addReply error:', err?.message || err);
+    await notifyAdmins(`[DB ERROR] addReply failed: ${err?.message}`, { comment_id, replier_telegram_id });
+    throw err;
+  }
 }
 
-async function insertReactionRow(payload) {
-  // payload: { comment_id, user_id, type }
-  // simple insert (could add dedupe logic if needed)
-  const { data, error } = await supabase.from('voice_reactions').insert([payload]).select().maybeSingle();
-  return { data, error };
+async function listRepliesForComment(comment_id) {
+  const db = initSupabase();
+  if (!db || !db.from) throw new Error('SUPABASE_NOT_CONFIGURED');
+  const { data } = await db.from('replies').select('*').eq('comment_id', comment_id).order('created_at', { ascending: true });
+  return data || [];
 }
 
-async function addNotificationRow(payload) {
-  const { data, error } = await supabase.from('notifications').insert([payload]).select().maybeSingle();
-  return { data, error };
-}
-
-async function listNotifications(telegram_id, type = null, limit = 20) {
-  let q = supabase.from('notifications').select('*').eq('telegram_id', telegram_id).order('created_at', { ascending: false }).limit(limit);
-  if (type) q = q.eq('type', type);
-  const { data, error } = await q;
-  return { data, error };
-}
-
-async function markAllNotificationsRead(telegram_id) {
-  const { error } = await supabase.from('notifications').update({ read: true }).eq('telegram_id', telegram_id);
-  return { error };
-}
-
-async function toggleFavoriteRow(telegram_id, comment_id) {
-  // if exists remove, else add
-  const { data: existing } = await supabase.from('favorites').select('*').eq('telegram_id', telegram_id).eq('comment_id', comment_id).limit(1).maybeSingle();
-  if (existing) {
-    const { error } = await supabase.from('favorites').delete().eq('id', existing.id);
-    return { removed: true, error };
-  } else {
-    const { data, error } = await supabase.from('favorites').insert([{ telegram_id, comment_id }]).select().maybeSingle();
-    return { removed: false, data, error };
+// FAVORITES
+async function toggleFavorite(comment_id, telegram_id) {
+  const db = initSupabase();
+  if (!db || !db.from) throw new Error('SUPABASE_NOT_CONFIGURED');
+  try {
+    const { data: exists } = await db.from('favorites').select('*').eq('comment_id', comment_id).eq('telegram_id', telegram_id).limit(1);
+    if (exists && exists.length) {
+      await db.from('favorites').delete().eq('id', exists[0].id);
+      return { removed: true };
+    } else {
+      const { data } = await db.from('favorites').insert({ comment_id, telegram_id }).select().single();
+      return { added: true, id: data.id };
+    }
+  } catch (err) {
+    console.error('[db] toggleFavorite error:', err?.message || err);
+    await notifyAdmins(`[DB ERROR] toggleFavorite failed: ${err?.message}`, { comment_id, telegram_id });
+    throw err;
   }
 }
 
 async function listFavoritesForUser(telegram_id) {
-  const { data: favs, error } = await supabase.from('favorites').select('comment_id').eq('telegram_id', telegram_id).order('created_at', { ascending: false }).limit(500);
-  if (error) throw error;
-  if (!favs || favs.length === 0) return [];
-  const ids = favs.map(f => f.comment_id);
-  const { data: comments } = await supabase.from('voice_comments').select('*').in('id', ids).order('created_at', { ascending: false });
-  return comments || [];
+  const db = initSupabase();
+  if (!db || !db.from) throw new Error('SUPABASE_NOT_CONFIGURED');
+  const { data } = await db.from('favorites').select('*,voice_comments(*)').eq('telegram_id', telegram_id).order('created_at', { ascending: false });
+  return data || [];
 }
 
-async function searchCommentById(id) {
-  const { data } = await supabase.from('voice_comments').select('*').eq('id', id).limit(1).maybeSingle();
-  return data || null;
-}
-
-// NEW: isFavorite helper used by bot to show star state
-async function isFavorite(telegram_id, comment_id) {
-  if (!telegram_id || !comment_id) return false;
+// REACTIONS
+async function addReaction(comment_id, telegram_id, type) {
+  const db = initSupabase();
+  if (!db || !db.from) throw new Error('SUPABASE_NOT_CONFIGURED');
   try {
-    const { data } = await supabase.from('favorites').select('*').eq('telegram_id', telegram_id).eq('comment_id', comment_id).limit(1).maybeSingle();
-    return !!data;
-  } catch (e) {
-    console.error('isFavorite error', e);
-    return false;
+    const { data } = await db.from('reactions').insert({ comment_id, telegram_id, type }).select().single();
+    return data;
+  } catch (err) {
+    console.error('[db] addReaction error:', err?.message || err);
+    await notifyAdmins(`[DB ERROR] addReaction failed: ${err?.message}`, { comment_id, telegram_id, type });
+    throw err;
+  }
+}
+
+async function countReactions(comment_id) {
+  const db = initSupabase();
+  if (!db || !db.rpc) throw new Error('SUPABASE_NOT_CONFIGURED');
+  try {
+    const { data } = await db.from('reactions').select('*').eq('comment_id', comment_id);
+    return data ? data.length : 0;
+  } catch (err) {
+    console.error('[db] countReactions error:', err?.message || err);
+    return 0;
+  }
+}
+
+// PAYMENTS
+async function createPaymentRequest({ telegram_id, package_name, comments_amount, amount, method }) {
+  const db = initSupabase();
+  if (!db || !db.from) throw new Error('SUPABASE_NOT_CONFIGURED');
+  try {
+    const { data } = await db.from('payment_requests').insert({
+      telegram_id,
+      package_name,
+      comments_amount,
+      amount,
+      method,
+      status: 'pending'
+    }).select().single();
+    // notify admins
+    await notifyAdmins(`[PAYMENT REQUEST] ${telegram_id} requested ${package_name} ${comments_amount} comments for ${amount} (${method})`, { payment_request_id: data.id });
+    return data;
+  } catch (err) {
+    console.error('[db] createPaymentRequest error:', err?.message || err);
+    await notifyAdmins(`[DB ERROR] createPaymentRequest failed: ${err?.message}`, { telegram_id });
+    throw err;
+  }
+}
+
+async function attachPaymentProof(payment_request_id, proof_telegram_file_id) {
+  const db = initSupabase();
+  if (!db || !db.from) throw new Error('SUPABASE_NOT_CONFIGURED');
+  try {
+    const { data } = await db.from('payment_requests').update({
+      proof_telegram_file_id,
+      status: 'proof_submitted'
+    }).eq('id', payment_request_id).select().single();
+    await notifyAdmins(`[PAYMENT PROOF] request ${payment_request_id} proof submitted`, { payment_request_id, proof_telegram_file_id });
+    return data;
+  } catch (err) {
+    console.error('[db] attachPaymentProof error:', err?.message || err);
+    await notifyAdmins(`[DB ERROR] attachPaymentProof failed: ${err?.message}`, { payment_request_id });
+    throw err;
   }
 }
 
 module.exports = {
-  supabase,
-  ensureUserRow,
-  createThread,
-  getThreadByLink,
-  insertVoiceComment,
-  listCommentsByThread,
+  initSupabase,
+  setAdminNotifier,
+  notifyAdmins,
+  ensureUser,
+  findOrCreateThread,
+  addVoiceComment,
+  listCommentsForThread,
   getCommentById,
-  insertReplyRow,
-  insertReactionRow,
-  addNotificationRow,
-  listNotifications,
-  markAllNotificationsRead,
-  toggleFavoriteRow,
+  addReply,
+  listRepliesForComment,
+  toggleFavorite,
   listFavoritesForUser,
-  searchCommentById,
-  isFavorite
+  addReaction,
+  countReactions,
+  createPaymentRequest,
+  attachPaymentProof
 };
