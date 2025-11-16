@@ -1,66 +1,63 @@
-// path: index.js
-// Local express server for testing the webhook endpoint and for optional polling mode.
-// Usage: cp .env.example .env && edit && npm start
-require('dotenv').config();
-
+// index.js — local + webhook entry
 const express = require('express');
 const bodyParser = require('body-parser');
-const { initBot } = require('./src/bot');
 
-const PORT = process.env.PORT || 3000;
-const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || process.env.WEBHOOK_TOKEN || null;
-const LOCAL_POLLING = process.env.LOCAL_POLLING === '1' || process.env.LOCAL_POLLING === 'true';
-
-const app = express();
-app.use(bodyParser.json({ limit: '10mb' }));
-
-app.get('/api/telegram', (req, res) => {
-  res.json({ ok: true, info: 'health - send POST with ?token=...' });
-});
-
-app.post('/api/telegram', async (req, res) => {
-  const token = req.query.token || req.headers['x-webhook-secret'];
-  if (!WEBHOOK_SECRET) {
-    console.warn('[webhook] WEBHOOK_SECRET not set locally. Rejecting.');
-    return res.status(403).send('WEBHOOK_SECRET not set');
-  }
-  if (String(token) !== String(WEBHOOK_SECRET)) {
-    console.warn('[webhook] invalid token on local POST');
-    return res.status(403).send('invalid token');
-  }
-
-  const update = req.body;
-  if (!update) return res.status(400).send('no update');
-
+(async () => {
   try {
-    const botObj = await initBot();
-    if (botObj && botObj.handleUpdate) {
-      // handle but return quickly
-      botObj.handleUpdate(update).catch(err => {
-        console.error('[local] handleUpdate error', err?.message || err);
-      });
-      return res.status(200).send('ok');
-    } else {
-      console.error('[local] initBot missing handleUpdate');
-      return res.status(500).send('bot not ready');
+    const { initBot } = require('./src/bot');
+    if (!initBot) throw new Error('initBot export not found in ./src/bot');
+
+    const bot = await initBot();
+    console.log('[bot] initBot returned');
+
+    // debug: confirm token and connectivity
+    try {
+      const me = await bot.telegram.getMe();
+      console.log('[bot] connected as:', me.username || me.id);
+    } catch (e) {
+      console.error('[bot] getMe failed — token/connectivity problem:', e && e.message);
     }
-  } catch (err) {
-    console.error('[local] POST /api/telegram error', err?.message || err);
-    return res.status(500).send('server error');
-  }
-});
 
-app.listen(PORT, async () => {
-  console.log(`[web] local server listening on http://localhost:${PORT}`);
-  // initialize bot (may launch polling if LOCAL_POLLING=1)
-  try {
-    await initBot();
+    // Launch polling when LOCAL_POLLING is set to '1' (string) or 1 (number)
+    if (process.env.LOCAL_POLLING === '1' || process.env.LOCAL_POLLING === 'true' || process.env.LOCAL_POLLING === 1) {
+      await bot.launch();
+      console.log('[bot] launched in POLLING mode');
+    } else {
+      console.log('[bot] LOCAL_POLLING not set — bot not launched in polling (webhook expected)');
+    }
+
+    // small express app for local debugging and for webhook usage (Vercel uses its own handler,
+    // but this keeps parity for local testing)
+    const app = express();
+    app.use(bodyParser.json());
+
+    app.get('/', (req, res) => res.send('ok'));
+
+    // webhook endpoint (Vercel-style: POST /api/telegram?token=SECRET)
+    app.post('/api/telegram', async (req, res) => {
+      const qToken = req.query.token || req.headers['x-webhook-secret'];
+      if (process.env.WEBHOOK_SECRET && qToken !== process.env.WEBHOOK_SECRET) {
+        console.warn('[webhook] invalid token', qToken);
+        return res.status(403).send('invalid token');
+      }
+      try {
+        await bot.handleUpdate(req.body);
+        return res.json({ ok: true });
+      } catch (e) {
+        console.error('[webhook] handleUpdate error', e && (e.stack || e.message));
+        return res.status(500).json({ ok: false, error: e && e.message });
+      }
+    });
+
+    const port = process.env.PORT || 3000;
+    app.listen(port, () => console.log(`[web] local server listening on http://localhost:${port}`));
+
+    // graceful stop (optional)
+    process.once('SIGINT', () => { bot.stop('SIGINT'); process.exit(0); });
+    process.once('SIGTERM', () => { bot.stop('SIGTERM'); process.exit(0); });
+
   } catch (err) {
-    console.error('[web] bot init failed at startup', err?.message || err);
+    console.error('Fatal start error', err && (err.stack || err.message));
+    process.exit(1);
   }
-  if (!LOCAL_POLLING) {
-    console.log('[web] Running in webhook mode locally; POST to /api/telegram?token=YOUR_SECRET');
-  } else {
-    console.log('[web] Running in polling mode (LOCAL_POLLING=1)');
-  }
-});
+})();

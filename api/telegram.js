@@ -1,93 +1,102 @@
-// path: api/telegram.js
-// Vercel serverless webhook handler for Telegram updates.
-// Validates query token against WEBHOOK_SECRET and forwards update to bot.handleUpdate.
+// api/telegram.js
+// Vercel serverless webhook handler for telegram.
+// Expects src/bot.js to export initBot() that returns a Telegraf bot instance.
 
-const express = require('express'); // serversless wrappers frequently support express-like handlers
-const bodyParser = require('body-parser');
+const assert = require('assert');
+
+let botSingleton = null;
+let botInitPromise = null;
+
+function tryRequireBotModule() {
+  // try multiple relative paths (api/telegram.js runs from project root on Vercel)
+  const tryPaths = [
+    './src/bot',
+    '../src/bot', // in case file layout differs
+    './bot',
+    '../bot'
+  ];
+  for (const p of tryPaths) {
+    try {
+      // require resolves relative to this file
+      // use require.resolve to check presence
+      // plain require and test export
+      const m = require(p);
+      if (m && typeof m.initBot === 'function') return m;
+      // older patterns might export default or the bot directly
+      if (m && typeof m === 'function' && m.handleUpdate) {
+        // m is a bot instance
+        return { initBot: async () => m };
+      }
+    } catch (e) {
+      // ignore and try next
+    }
+  }
+  throw new Error('Could not require src/bot (tried multiple paths).');
+}
+
+async function getBotSingleton() {
+  if (botSingleton) return botSingleton;
+  if (!botInitPromise) {
+    botInitPromise = (async () => {
+      const mod = tryRequireBotModule();
+      if (!mod || typeof mod.initBot !== 'function') throw new Error('Could not require src/bot (expected initBot export)');
+      const bot = await mod.initBot();
+      if (!bot || typeof bot.handleUpdate !== 'function') {
+        throw new Error('Bot returned from initBot is invalid (no handleUpdate).');
+      }
+      botSingleton = bot;
+      return botSingleton;
+    })();
+  }
+  return botInitPromise;
+}
 
 module.exports = async function handler(req, res) {
-  // Minimal compatibility wrapper so file can be used both as a Vercel api and in local server if required.
-  // For Vercel, you typically export (req,res) directly. This module export returns a function that Vercel will call.
-  // However for safety, we detect and handle both direct invocation and module use.
+  // Protect endpoint by token query param if WEBHOOK_SECRET provided in Vercel env
+  const expected = process.env.WEBHOOK_SECRET || process.env.VERCEL_WEBHOOK_SECRET || process.env.NETLIFY_WEBHOOK_SECRET;
+  const provided = (req.query && (req.query.token || req.query.secret)) || null;
 
-  // Implementation expects req, res passed by platform.
-  try {
-    // Verify secret token passed as query param ?token=
-    const expected = process.env.WEBHOOK_SECRET || process.env.WEBHOOK_TOKEN || null;
-    const provided = (req.query && (req.query.token || req.query.secret)) || (req.headers && (req.headers['x-webhook-secret'] || req.headers['x-telegram-secret']));
-    if (!expected) {
-      console.warn('[webhook] WEBHOOK_SECRET not configured; refusing to accept updates for security.');
-      res.status(403).send('Webhook secret not configured on server');
-      return;
-    }
-    if (!provided || String(provided) !== String(expected)) {
-      console.warn('[webhook] invalid webhook token attempt');
-      res.status(403).send('Invalid token');
-      return;
-    }
+  if (req.method === 'GET') {
+    return res.status(200).json({ ok: true, msg: 'debug ok', time: new Date().toISOString() });
+  }
 
-    // parse body as JSON
-    const update = req.body;
-    if (!update) {
-      res.status(400).send('No update payload');
-      return;
-    }
-
-    // robustly require the bot module from possible paths
-    let botModule = null;
-    try {
-      botModule = require('../src/bot');
-    } catch (e1) {
-      try {
-        botModule = require('./src/bot');
-      } catch (e2) {
-        console.error('[webhook] cannot require src/bot:', e1.message, e2.message);
-      }
-    }
-
-    if (!botModule || !botModule.initBot) {
-      console.error('[webhook] bot module missing initBot; cannot handle update');
-      // respond 200 to avoid repeated retries, but log
-      res.status(200).send('bot not available');
-      return;
-    }
-
-    const botObj = await botModule.initBot();
-    if (!botObj) {
-      console.error('[webhook] initBot returned nothing');
-      res.status(200).send('init error');
-      return;
-    }
-
-    // call handleUpdate asynchronously but respond immediately where possible
-    try {
-      // Pass the update to bot.handleUpdate
-      if (botObj.handleUpdate) {
-        // Do not await long: schedule processing and return 200 quickly.
-        botObj.handleUpdate(update).catch((err) => {
-          console.error('[webhook] handleUpdate failed:', err?.message || err);
-        });
-        res.status(200).send('ok');
-        return;
-      } else if (botObj.bot && botObj.bot.handleUpdate) {
-        botObj.bot.handleUpdate(update).catch((err) => {
-          console.error('[webhook] bot.handleUpdate failed:', err?.message || err);
-        });
-        res.status(200).send('ok');
-        return;
-      } else {
-        console.error('[webhook] no handleUpdate method found on bot object');
-        res.status(200).send('no handler');
-        return;
-      }
-    } catch (err) {
-      console.error('[webhook] update dispatch failed synchronously', err?.message || err);
-      res.status(500).send('dispatch error');
-      return;
-    }
-  } catch (err) {
-    console.error('[webhook] top-level error', err?.message || err);
-    try { res.status(500).send('internal error'); } catch (e) {}
+  // Only allow POST for Telegram updates
+  if (req.method !== 'POST') {
+    res.status(405).send('Method Not Allowed');
     return;
+  }
+
+  if (expected) {
+    if (!provided || provided !== expected) {
+      // Return 403 so Telegram stops delivering updates to wrong url
+      res.status(403).send('Missing or wrong token.');
+      return;
+    }
+  } // if no expected secret defined, allow through (use WITH CAUTION)
+
+  let update = null;
+  try {
+    update = req.body;
+    if (!update || Object.keys(update).length === 0) {
+      // maybe raw buffer?
+      try { update = JSON.parse(Buffer.from(req.rawBody || req.body || '').toString() || '{}'); } catch(_) { update = req.body; }
+    }
+  } catch (e) {
+    console.error('Invalid JSON body', e && e.message);
+    // respond 200 to avoid repeated attempts, but log for debugging
+    res.status(400).send('Bad Request');
+    return;
+  }
+
+  try {
+    const bot = await getBotSingleton();
+    // Let the bot handle the update
+    await bot.handleUpdate(update, undefined);
+    // reply quickly
+    res.status(200).send('OK');
+  } catch (e) {
+    console.error('[webhook] Failed to handle update:', e && (e.stack || e.message));
+    // Respond 500 for visibility; you can change to 200 to stop Telegram retries (but 500 surfaces error in logs)
+    res.status(500).send('Server error processing update');
   }
 };
