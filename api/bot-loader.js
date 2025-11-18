@@ -1,25 +1,80 @@
-﻿/*
- api/bot-loader.js
- Simple loader that exports initBot() and points to the real bot file.
- Edit the require path below ONLY if your bot is NOT at src/bot.js
-*/
-let mod = null;
-try {
-  mod = require('../src/bot'); // <= change this if your bot lives somewhere else
-} catch (e1) {
-  try { mod = require('../bot'); } catch (e2) {
-    throw new Error('bot-loader: could not require ../src/bot or ../bot; adjust path.');
+﻿// api/bot-loader.js
+// Lazy loader that tries several candidate paths and logs full error details.
+// Exports initBot() which either returns a Telegraf bot or throws with detailed info.
+
+const path = require('path');
+
+const candidates = [
+  './src/bot',
+  './src/bot.js',
+  './bot',
+  './bot.js',
+  './dist/src/bot',
+  '../src/bot',
+  '../bot',
+  './index',
+  './index.js',
+  './api/src/bot',
+  './api/bot'
+];
+
+function tryRequireCandidate(relPath) {
+  const abs = path.resolve(process.cwd(), relPath);
+  try {
+    const mod = require(abs);
+    return { ok: true, module: mod, resolved: abs };
+  } catch (err) {
+    return { ok: false, error: err, attempted: abs };
   }
 }
 
-if (!mod) throw new Error('bot-loader: loaded module is null');
+module.exports.initBot = async function initBot() {
+  const results = [];
+  for (const c of candidates) {
+    const r = tryRequireCandidate(c);
+    results.push(r);
+    if (r.ok) {
+      // Normalize shapes
+      const m = r.module;
+      try {
+        if (typeof m.initBot === 'function') {
+          const maybe = m.initBot();
+          const bot = (maybe && typeof maybe.then === 'function') ? await maybe : maybe;
+          if (bot && typeof bot.handleUpdate === 'function') return bot;
+          throw new Error('initBot returned invalid bot (missing handleUpdate)');
+        } else if (m && typeof m.handleUpdate === 'function') {
+          return m;
+        } else if (m && m.default && typeof m.default.initBot === 'function') {
+          const maybe = m.default.initBot();
+          const bot = (maybe && typeof maybe.then === 'function') ? await maybe : maybe;
+          if (bot && typeof bot.handleUpdate === 'function') return bot;
+          throw new Error('default.initBot returned invalid bot');
+        } else {
+          throw new Error('module loaded but does not export initBot() or a bot instance');
+        }
+      } catch (innerErr) {
+        // If module loaded but initBot threw, return debug info
+        const info = {
+          message: innerErr.message,
+          stack: innerErr.stack,
+          resolved: r.resolved,
+          note: 'module required successfully but initBot() or returned bot threw'
+        };
+        const err = new Error('initBot failure; see loader.debug');
+        err.loaderDebug = info;
+        throw err;
+      }
+    }
+  }
 
-if (typeof mod.initBot === 'function') {
-  module.exports.initBot = async () => mod.initBot();
-} else if (mod.default && typeof mod.default.initBot === 'function') {
-  module.exports.initBot = async () => mod.default.initBot();
-} else if (mod && typeof mod.handleUpdate === 'function') {
-  module.exports.initBot = async () => mod;
-} else {
-  throw new Error('bot-loader: loaded module does not export initBot() or a bot instance');
-}
+  // If we get here, none of the candidates required successfully.
+  const aggregated = results.map(x => ({
+    attempted: x.attempted || x.resolved,
+    ok: !!x.ok,
+    error: x.ok ? null : (x.error && x.error.message)
+  }));
+  const msg = 'Could not require any candidate module. Attempts: ' + JSON.stringify(aggregated, null, 2);
+  const err = new Error(msg);
+  err.loaderAttempts = aggregated;
+  throw err;
+};
