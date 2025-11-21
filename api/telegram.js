@@ -1,152 +1,85 @@
-// path: api/telegram.js
-// Robust Vercel webhook handler for the voice-comment bot.
-// Accepts many shapes from src/bot: direct handleUpdate export, initBot returning Telegraf instance,
-// initBot returning { bot, handleUpdate }, or module exporting the bot directly.
+// api/telegram.js
+// CommonJS serverless handler for Vercel that forwards Telegram updates to src/bot.js
+// - Verifies optional secret token header if WEBHOOK_SECRET is set.
+// - Uses require() because src/bot.js is CommonJS (exports.handleUpdate).
+// - Returns quickly with proper HTTP codes and logs errors.
 
-const CANDIDATES = [
-  './src/bot',
-  '../src/bot',
-  './bot',
-  '../bot',
-  './src/bot.js',
-  '../src/bot.js'
-];
+const getRawBody = (req) =>
+  new Promise((resolve, reject) => {
+    let data = '';
+    req.setEncoding('utf8');
+    req.on('data', chunk => data += chunk);
+    req.on('end', () => resolve(data));
+    req.on('error', err => reject(err));
+  });
 
-function log(...args) {
-  console.log('[webhook]', ...args);
-}
-
-async function tryRequireCandidate() {
-  for (const p of CANDIDATES) {
-    try {
-      const mod = require(p);
-      log('required bot module from', p);
-      return { mod, path: p };
-    } catch (err) {
-      // keep trying
-      // not logging full stack to avoid noise, but log message
-      log(`require ${p} failed: ${err && err.message}`);
-    }
-  }
-  log('no bot module found in candidate paths');
-  return null;
-}
-
-function isTelegrafLike(obj) {
-  if (!obj || typeof obj !== 'object') return false;
-  return typeof obj.handleUpdate === 'function' && obj.telegram;
-}
-
-async function initAndExtractHandler() {
-  const found = await tryRequireCandidate();
-  if (!found) return { error: 'bot_module_not_found' };
-  const { mod, path } = found;
-
-  // 1) module exports handleUpdate directly
-  if (typeof mod.handleUpdate === 'function') {
-    log('using module.handleUpdate (direct export)');
-    return { handler: mod.handleUpdate.bind(mod), info: 'module.handleUpdate' };
-  }
-
-  // 2) module exports initBot -> call it and inspect return
-  if (typeof mod.initBot === 'function') {
-    try {
-      log('calling initBot() from', path);
-      const res = await mod.initBot();
-
-      // If initBot returned a Telegraf instance
-      if (isTelegrafLike(res)) {
-        log('initBot() returned Telegraf-like instance (has handleUpdate). Using bot.handleUpdate');
-        return { handler: res.handleUpdate.bind(res), info: 'initBot_returned_telegraf' };
-      }
-
-      // If initBot returned an object that contains handleUpdate
-      if (res && typeof res.handleUpdate === 'function') {
-        log('initBot() returned object with handleUpdate');
-        return { handler: res.handleUpdate.bind(res), info: 'initBot_returned_handleUpdate' };
-      }
-
-      // If initBot returned an object with .bot which is Telegraf-like
-      if (res && res.bot && isTelegrafLike(res.bot)) {
-        log('initBot() returned { bot } where bot is Telegraf-like. Using bot.handleUpdate');
-        return { handler: res.bot.handleUpdate.bind(res.bot), info: 'initBot_returned_obj_bot' };
-      }
-
-      // Lastly, maybe module itself is the Telegraf instance or has a handleUpdate property not found earlier
-      if (isTelegrafLike(mod)) {
-        log('module itself appears Telegraf-like');
-        return { handler: mod.handleUpdate.bind(mod), info: 'module_telegraf_like' };
-      }
-
-      log('initBot() returned but no usable handler found. Returned keys: ' + Object.keys(res || {}).join(','));
-      return { error: 'initBot_no_handler', detail: Object.keys(res || {}) };
-    } catch (err) {
-      log('initBot() threw:', err && (err.stack || err.message));
-      return { error: 'initBot_threw', detail: err && (err.stack || err.message) };
-    }
-  }
-
-  // 3) module itself might be a Telegraf instance
-  if (isTelegrafLike(mod)) {
-    log('module is Telegraf-like');
-    return { handler: mod.handleUpdate.bind(mod), info: 'module_telegraf' };
-  }
-
-  // fallback
-  log('module found but no initBot and no handleUpdate');
-  return { error: 'module_no_init_or_handle' };
-}
-
-module.exports = async function handler(req, res) {
+module.exports = async (req, res) => {
   try {
-    if (req.method === 'GET') return res.status(200).send('ok');
+    // Health check for browser / Vercel probe
+    if (req.method === 'GET') {
+      res.statusCode = 200;
+      res.setHeader('Content-Type', 'text/plain');
+      res.end('OK');
+      return;
+    }
 
     if (req.method !== 'POST') {
-      res.setHeader('Allow', 'GET,POST');
-      return res.status(405).send('Method Not Allowed');
+      res.statusCode = 405;
+      res.end('Method Not Allowed');
+      return;
     }
 
-    // validate token
-    const token = (req.query && req.query.token) || req.headers['x-webhook-secret'] || req.headers['x-telegram-bot-api-secret-token'];
-    if (process.env.WEBHOOK_SECRET && token !== process.env.WEBHOOK_SECRET) {
-      log('invalid webhook token', token);
-      return res.status(403).send('invalid token');
-    }
-
-    if (!req.body) {
-      log('no body in request');
-      return res.status(400).send('no body');
-    }
-
-    const initResult = await initAndExtractHandler();
-
-    if (initResult.handler) {
-      try {
-        await initResult.handler(req.body);
-        return res.status(200).json({ ok: true, info: initResult.info || null });
-      } catch (err) {
-        log('handler threw:', err && (err.stack || err.message));
-        if (process.env.WEBHOOK_STRICT === '1') {
-          return res.status(500).json({ ok: false, error: 'handler_error', detail: String(err && (err.stack || err.message)) });
-        } else {
-          // swallow but log
-          return res.status(200).json({ ok: true, note: 'handler error logged' });
-        }
-      }
-    } else {
-      log('no handler available after init:', initResult.error, initResult.detail || '');
-      if (process.env.WEBHOOK_STRICT === '1') {
-        return res.status(500).json({ ok: false, error: initResult.error, detail: initResult.detail || '' });
-      } else {
-        return res.status(200).json({ ok: true, note: 'no handler available; logged' });
+    // Optional secret token verification (Telegram's setWebhook secret_token -> header X-Telegram-Bot-Api-Secret-Token)
+    const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
+    if (WEBHOOK_SECRET) {
+      const header = (req.headers['x-telegram-bot-api-secret-token'] || req.headers['x-telegram-bot-secret-token'] || '').toString();
+      if (!header || header !== WEBHOOK_SECRET) {
+        console.warn('telegram webhook: secret token mismatch');
+        res.statusCode = 401;
+        res.end('Unauthorized');
+        return;
       }
     }
-  } catch (outer) {
-    log('unexpected error in webhook:', outer && (outer.stack || outer.message));
-    if (process.env.WEBHOOK_STRICT === '1') {
-      return res.status(500).json({ ok: false, error: 'unexpected', detail: String(outer && (outer.stack || outer.message)) });
-    } else {
-      return res.status(200).json({ ok: true, note: 'unexpected error logged' });
+
+    // Read raw body and parse JSON (Telegram sends JSON)
+    const raw = await getRawBody(req);
+    let update;
+    try {
+      update = raw ? JSON.parse(raw) : {};
+    } catch (e) {
+      console.warn('telegram webhook: invalid JSON body', e && e.message);
+      res.statusCode = 400;
+      res.end('Bad Request');
+      return;
     }
+
+    // Require your bot module (CommonJS). Adjust path if your bot file lives elsewhere.
+    // Your uploaded bot.js exports handleUpdate / initBot (CommonJS). See src/bot.js in your repo.
+    const botModule = require('../src/bot.js');
+    const handleUpdate = botModule && (botModule.handleUpdate || (botModule.default && botModule.default.handleUpdate));
+
+    if (!handleUpdate || typeof handleUpdate !== 'function') {
+      console.error('telegram webhook: bot handler not found (expect handleUpdate(update))');
+      res.statusCode = 500;
+      res.end('Server misconfigured');
+      return;
+    }
+
+    // Forward update to your bot and wait for it to process it (so errors are visible in logs)
+    try {
+      await Promise.resolve(handleUpdate(update));
+    } catch (err) {
+      // bot processing error — log and continue returning 200 (so Telegram won't rapidly retry)
+      console.error('telegram webhook: bot.handleUpdate threw:', err && (err.stack || err.message));
+      // still respond 200 to avoid webhook flood — admins will be notified by your bot if needed
+    }
+
+    // Success
+    res.statusCode = 200;
+    res.end('OK');
+  } catch (err) {
+    console.error('telegram webhook handler top-level error:', err && (err.stack || err.message));
+    res.statusCode = 500;
+    res.end('Internal Server Error');
   }
 };
