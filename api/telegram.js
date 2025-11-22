@@ -1,85 +1,44 @@
 // api/telegram.js
-// CommonJS serverless handler for Vercel that forwards Telegram updates to src/bot.js
-// - Verifies optional secret token header if WEBHOOK_SECRET is set.
-// - Uses require() because src/bot.js is CommonJS (exports.handleUpdate).
-// - Returns quickly with proper HTTP codes and logs errors.
+// CommonJS style — works on Vercel Node runtime (Node 18+)
+const { initBot } = require('../src/bot');
 
-const getRawBody = (req) =>
-  new Promise((resolve, reject) => {
-    let data = '';
-    req.setEncoding('utf8');
-    req.on('data', chunk => data += chunk);
-    req.on('end', () => resolve(data));
-    req.on('error', err => reject(err));
-  });
+let botPromise; // keep the bot across cold-starts in module scope
+
+// Optionally require secret to match Telegram secret_token header
+const EXPECTED_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || null;
 
 module.exports = async (req, res) => {
+  // quick health endpoint
+  if (req.method === 'GET') {
+    return res.status(200).send('OK - Telegram webhook endpoint');
+  }
+
+  // optional secret_token check (recommended)
+  if (EXPECTED_SECRET) {
+    const header = req.headers['x-telegram-bot-api-secret-token'];
+    if (!header || header !== EXPECTED_SECRET) {
+      console.warn('Webhook secret mismatch', header);
+      return res.status(401).send('Unauthorized');
+    }
+  }
+
+  // Telegram sends JSON body
+  if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
+
   try {
-    // Health check for browser / Vercel probe
-    if (req.method === 'GET') {
-      res.statusCode = 200;
-      res.setHeader('Content-Type', 'text/plain');
-      res.end('OK');
-      return;
-    }
+    if (!botPromise) botPromise = initBot(); // returns a Telegraf instance (your code)
+    const bot = await botPromise;
 
-    if (req.method !== 'POST') {
-      res.statusCode = 405;
-      res.end('Method Not Allowed');
-      return;
-    }
+    // Pass the update to telegraf to handle it
+    // Using handleUpdate is serverless-friendly (no bot.launch / polling).
+    await bot.handleUpdate(req.body, res);
 
-    // Optional secret token verification (Telegram's setWebhook secret_token -> header X-Telegram-Bot-Api-Secret-Token)
-    const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
-    if (WEBHOOK_SECRET) {
-      const header = (req.headers['x-telegram-bot-api-secret-token'] || req.headers['x-telegram-bot-secret-token'] || '').toString();
-      if (!header || header !== WEBHOOK_SECRET) {
-        console.warn('telegram webhook: secret token mismatch');
-        res.statusCode = 401;
-        res.end('Unauthorized');
-        return;
-      }
-    }
-
-    // Read raw body and parse JSON (Telegram sends JSON)
-    const raw = await getRawBody(req);
-    let update;
-    try {
-      update = raw ? JSON.parse(raw) : {};
-    } catch (e) {
-      console.warn('telegram webhook: invalid JSON body', e && e.message);
-      res.statusCode = 400;
-      res.end('Bad Request');
-      return;
-    }
-
-    // Require your bot module (CommonJS). Adjust path if your bot file lives elsewhere.
-    // Your uploaded bot.js exports handleUpdate / initBot (CommonJS). See src/bot.js in your repo.
-    const botModule = require('../src/bot.js');
-    const handleUpdate = botModule && (botModule.handleUpdate || (botModule.default && botModule.default.handleUpdate));
-
-    if (!handleUpdate || typeof handleUpdate !== 'function') {
-      console.error('telegram webhook: bot handler not found (expect handleUpdate(update))');
-      res.statusCode = 500;
-      res.end('Server misconfigured');
-      return;
-    }
-
-    // Forward update to your bot and wait for it to process it (so errors are visible in logs)
-    try {
-      await Promise.resolve(handleUpdate(update));
-    } catch (err) {
-      // bot processing error — log and continue returning 200 (so Telegram won't rapidly retry)
-      console.error('telegram webhook: bot.handleUpdate threw:', err && (err.stack || err.message));
-      // still respond 200 to avoid webhook flood — admins will be notified by your bot if needed
-    }
-
-    // Success
-    res.statusCode = 200;
-    res.end('OK');
+    // If bot.handleUpdate didn't end the response, ensure we send 200
+    if (!res.headersSent) res.status(200).send('OK');
   } catch (err) {
-    console.error('telegram webhook handler top-level error:', err && (err.stack || err.message));
-    res.statusCode = 500;
-    res.end('Internal Server Error');
+    console.error('telegram webhook handler error', err);
+    // respond 200 to Telegram if you want to avoid repeated deliveries,
+    // but during debugging 500 is useful. We'll return 500 here.
+    res.status(500).send('Server error');
   }
 };
