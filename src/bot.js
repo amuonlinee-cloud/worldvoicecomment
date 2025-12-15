@@ -1,4 +1,3 @@
-// src/bot.js
 // World Voice Comment — fixed: canonical lookups, balance decrement, replies reporting, favorites link, pending flow fixes
 
 const { Telegraf, Markup } = require('telegraf');
@@ -145,9 +144,11 @@ safeDb.listCommentsByThread = db.listCommentsByThread || (async (threadId, offse
 safeDb.getCommentById = db.getCommentById || (async (id) => {
   if (!id) return null;
   if (safeDb.supabase) {
-    const { data, error } = await safeDb.supabase.from('voice_comments').select('*').eq('id', id).limit(1).maybeSingle();
-    if (error) throw error;
-    return data;
+    try {
+      const { data, error } = await safeDb.supabase.from('voice_comments').select('*').eq('id', id).limit(1).maybeSingle();
+      if (error) throw error;
+      return data;
+    } catch (e) { debugLog('getCommentById supabase err', e && e.message); return null; }
   }
   return null;
 });
@@ -571,7 +572,7 @@ async function initBot() {
       const cbeAcc = '1000555367884';
       const bankText = `*Payment details*\n\nTELEBIRR: \`${telebirr}\` (AMANUEL DESSALEGN ASFAW)\nCBE Account: \`${cbeAcc}\` (AMANUEL DESSALEGN ASFAW)\n\nAmount: *${pkg.amount} ETB*\n\nAfter payment press "Upload Proof" below then send the screenshot/photo or paste the payment link.\nOr use: /payproof ${pid}`;
 
-      await ctx.replyWithMarkdown(bankText);
+      await ctx.reply(bankText, { parse_mode: 'Markdown' });
 
       const inline = Markup.inlineKeyboard([
         [ Markup.button.callback('Copy TELEBIRR', `copy_tel|${telebirr}`), Markup.button.callback('Copy CBE', `copy_acc|${cbeAcc}`) ],
@@ -1275,9 +1276,19 @@ async function initBot() {
         const idx = Number(parts[1]);
         const pkg = PAYMENT_PACKAGES[idx];
         if (!pkg) { await ctx.answerCbQuery('Invalid package'); return; }
-        PendingMap.set(ctx.from.id, { type: 'buy_confirm', pkg });
-        await ctx.answerCbQuery();
-        return createPaymentRequestFlow(ctx, pkg);
+        // Immediately start the purchase flow and avoid requiring a second click.
+        try {
+          // Acknowledge callback quickly so the button doesn't stay loading
+          await ctx.answerCbQuery();
+          // Clear any previous pending buy_confirm for this user
+          PendingMap.delete(ctx.from.id);
+          // Directly invoke the payment creation flow
+          return await createPaymentRequestFlow(ctx, pkg);
+        } catch (e) {
+          console.error('buypkg handler err', e);
+          try { await ctx.answerCbQuery('Could not start purchase flow'); } catch (_) {}
+          return;
+        }
       }
 
       if (cmd === 'contact_whatsapp') {
