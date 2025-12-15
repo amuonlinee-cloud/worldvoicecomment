@@ -1,4 +1,6 @@
+// src/bot.js
 // World Voice Comment — fixed: canonical lookups, balance decrement, replies reporting, favorites link, pending flow fixes
+// Additional fixes: resilient payment flow, defensive DB-shape handling, safer admin_approve
 
 const { Telegraf, Markup } = require('telegraf');
 const debugLog = (...args) => console.log('[bot]', ...args);
@@ -70,9 +72,9 @@ safeDb.createThread = db.createThread || (async (link, creatorTelegramId = null)
   if (safeDb.supabase) {
     try {
       const { data, error } = await safeDb.supabase.from('threads').insert([{ social_link: link, creator_telegram_id: creatorTelegramId }]).select().maybeSingle();
-      if (error) throw error;
+      if (error) return { error };
       return data;
-    } catch (e) { debugLog('createThread supabase err', e && e.message); }
+    } catch (e) { debugLog('createThread supabase err', e && e.message); return { error: e }; }
   }
   return { id: Date.now(), social_link: link, creator_telegram_id: creatorTelegramId, created_at: new Date().toISOString() };
 });
@@ -187,7 +189,7 @@ safeDb.toggleFavoriteRow = db.toggleFavoriteRow || (async (telegramId, commentId
 safeDb.listFavoritesForUser = db.listFavoritesForUser || (async (telegramId) => {
   if (safeDb.supabase) {
     const { data, error } = await safeDb.supabase.from('favorites').select('id, comment_id, created_at, voice_comments( id, thread_id, telegram_file_id, first_name, username, created_at )').eq('telegram_id', telegramId).order('created_at', { ascending: false });
-    if (error) return [];
+    if (error) return { error };
     return (data || []).map(r => r.voice_comments).filter(Boolean);
   }
   return [];
@@ -394,8 +396,13 @@ async function showRepliesForComment(ctx, commentId, page = 1, perPage = 10) {
 // notifications command handler (reusable)
 async function handleNotificationsCommand(ctx) {
   try {
-    const res = await safeDb.listNotifications(ctx.from.id).catch(()=>({ data: [] }));
-    const rows = (res && res.data) ? res.data : (Array.isArray(res) ? res : (res || []));
+    const res = await safeDb.listNotifications(ctx.from.id).catch(()=>[]);
+    // normalize shapes: res may be array, or { data: [...] }, or object/error
+    let rows = [];
+    if (Array.isArray(res)) rows = res;
+    else if (res && Array.isArray(res.data)) rows = res.data;
+    else rows = [];
+
     if (!rows || rows.length === 0) return ctx.reply('No notifications yet.', mainKeyboard());
     for (const n of rows) {
       let text = n.message || '';
@@ -422,10 +429,16 @@ async function handleNotificationsCommand(ctx) {
 // favorites listing helper (exposed to keyboard flow) — now includes the video link
 async function showFavoritesCommand(ctx) {
   try {
-    const favRows = await listFavoritesForUser(ctx.from.id);
+    let favRows = await listFavoritesForUser(ctx.from.id);
+    // normalize shapes: favRows may be array or { data: [...] }
+    if (!Array.isArray(favRows)) {
+      if (favRows && Array.isArray(favRows.data)) favRows = favRows.data;
+      else favRows = [];
+    }
+
     if (!favRows || favRows.length === 0) return ctx.reply('No favorites yet.', mainKeyboard());
     for (const c of favRows) {
-      if (c.telegram_file_id) {
+      if (c && c.telegram_file_id) {
         await ctx.replyWithVoice(c.telegram_file_id, { caption: `${c.first_name || c.username || 'User'} • ${new Date(c.created_at).toLocaleString()}` });
       } else {
         await ctx.reply('Favorite comment (no voice stored).');
@@ -433,7 +446,7 @@ async function showFavoritesCommand(ctx) {
       // fetch thread for link (defensive)
       let videoLink = '(video unknown)';
       try {
-        const thread = await safeDb.getThreadById(c.thread_id);
+        const thread = await safeDb.getThreadById(c.thread_id).catch(()=>null);
         if (thread) videoLink = thread.social_link || thread.canonical_link || videoLink;
       } catch (e) {}
       const inline = await buildActionsInline(c.id, ctx.from.id);
@@ -450,7 +463,11 @@ async function showFavoritesCommand(ctx) {
 
 async function listFavoritesForUser(telegramId) {
   try {
-    return await safeDb.listFavoritesForUser(telegramId);
+    const res = await safeDb.listFavoritesForUser(telegramId);
+    // normalize shape
+    if (Array.isArray(res)) return res;
+    if (res && Array.isArray(res.data)) return res.data;
+    return res || [];
   } catch (e) { console.error('listFavoritesForUser err', e); return []; }
 }
 
@@ -557,21 +574,32 @@ async function initBot() {
   // createPaymentRequestFlow uses copy buttons + upload proof
   async function createPaymentRequestFlow(ctx, pkg) {
     try {
-      const created = await safeDb.createPaymentRequest({
-        telegram_id: ctx.from.id,
-        package_name: pkg.label,
-        comments_amount: pkg.credits,
-        amount: pkg.amount,
-        method: 'manual',
-        status: 'pending'
-      });
-      const requestRow = (created && created.data) ? created.data : created;
-      const pid = requestRow && requestRow.id ? requestRow.id : Math.floor(Math.random() * 100000);
+      let requestRow = null;
+      let pid = Math.floor(Math.random() * 100000);
+
+      // Try create payment request but don't fail the flow if DB errors
+      try {
+        const created = await safeDb.createPaymentRequest({
+          telegram_id: ctx.from.id,
+          package_name: pkg.label,
+          comments_amount: pkg.credits,
+          amount: pkg.amount,
+          method: 'manual',
+          status: 'pending'
+        });
+        requestRow = (created && created.data) ? created.data : created;
+        if (requestRow && requestRow.id) pid = requestRow.id;
+      } catch (e) {
+        // log but continue — we will still provide payment instructions even if DB is down
+        console.error('createPaymentRequestFlow createPaymentRequest err', e && (e.stack || e.message || e));
+        // fallback: pid already generated
+      }
 
       const telebirr = '0962058608';
       const cbeAcc = '1000555367884';
       const bankText = `*Payment details*\n\nTELEBIRR: \`${telebirr}\` (AMANUEL DESSALEGN ASFAW)\nCBE Account: \`${cbeAcc}\` (AMANUEL DESSALEGN ASFAW)\n\nAmount: *${pkg.amount} ETB*\n\nAfter payment press "Upload Proof" below then send the screenshot/photo or paste the payment link.\nOr use: /payproof ${pid}`;
 
+      // always send bank info even if createPaymentRequest failed
       await ctx.reply(bankText, { parse_mode: 'Markdown' });
 
       const inline = Markup.inlineKeyboard([
@@ -591,7 +619,7 @@ async function initBot() {
       }
       return;
     } catch (e) {
-      console.error('createPaymentRequestFlow err', e);
+      console.error('createPaymentRequestFlow err', e && (e.stack || e.message || e));
       try { await ctx.reply('Could not create payment request. Please contact support/WhatsApp.'); } catch (_) {}
       return;
     }
@@ -873,13 +901,15 @@ async function initBot() {
       try {
         await safeDb.ensureUserRow(ctx.from).catch(()=>null);
         const t = await safeDb.findOrCreateThread(maybeUrl, null);
-        if (!t || !t.id) {
+        if (!t || (!t.id && !(t.data && t.data.id))) {
           return ctx.reply('Thread created (fallback). Try listening again with the same link.', mainKeyboard());
         }
+        const threadId = t.id || (t.data && t.data.id);
         const inline = Markup.inlineKeyboard([
-          [Markup.button.callback('🎙 Add Voice Comment', `addvoice|${t.id}`), Markup.button.callback('🎧 Listen Comments', `listen|${t.id}|1`)]
+          [Markup.button.callback('🎙 Add Voice Comment', `addvoice|${threadId}`), Markup.button.callback('🎧 Listen Comments', `listen|${threadId}|1`)]
         ]);
-        await ctx.reply(`Thread created for: ${t.social_link || (t.canonical_link || maybeUrl)}`, inline);
+        const socialLink = (t.social_link || (t.canonical_link || maybeUrl)) || ((t.data && t.data.social_link) ? t.data.social_link : maybeUrl);
+        await ctx.reply(`Thread created for: ${socialLink}`, inline);
         return;
       } catch (e) {
         console.error('direct create thread error', e);
@@ -1328,13 +1358,22 @@ async function initBot() {
         try {
           const payment = await safeDb.getPaymentById(paymentId);
           if (!payment) { await ctx.answerCbQuery('Not found'); return; }
-          if (payment.status === 'approved') { await ctx.answerCbQuery('Already approved'); return; }
+          // payment might be direct row or { data: row }
+          const paymentRow = (payment && payment.id) ? payment : (payment && payment.data ? payment.data : null);
+          if (!paymentRow) { await ctx.answerCbQuery('Payment row not found'); return; }
+          if (paymentRow.status === 'approved') { await ctx.answerCbQuery('Already approved'); return; }
           const up = await safeDb.updatePaymentStatus(paymentId, 'approved');
           if (up && up.error) throw up.error;
-          const credits = Number(payment.comments_amount || 0) || 0;
-          await safeCreditUser(payment.telegram_id, credits);
+          const credits = Number(paymentRow.comments_amount || 0) || 0;
+          const targetTelegramId = paymentRow.telegram_id || paymentRow.telegramId || paymentRow.telegramId || paymentRow.telegram;
+          if (!targetTelegramId) {
+            await ctx.answerCbQuery('Missing payment owner');
+            console.error('admin_approve err: payment owner id missing for payment', paymentId, paymentRow);
+            return;
+          }
+          await safeCreditUser(targetTelegramId, credits);
           await ctx.answerCbQuery('Payment approved & credited');
-          try { await bot.telegram.sendMessage(payment.telegram_id, `Your payment #${paymentId} was approved. Credited ${credits} comments.`); } catch (_) {}
+          try { await bot.telegram.sendMessage(targetTelegramId, `Your payment #${paymentId} was approved. Credited ${credits} comments.`); } catch (_) {}
           return;
         } catch (e) {
           console.error('admin_approve err', e);
@@ -1352,7 +1391,10 @@ async function initBot() {
           const up = await safeDb.updatePaymentStatus(paymentId, 'rejected');
           if (up && up.error) throw up.error;
           await ctx.answerCbQuery('Payment rejected');
-          try { await bot.telegram.sendMessage(payment.telegram_id, `Your payment #${paymentId} was rejected. Contact admin.`); } catch (_) {}
+          const paymentRow = (payment && payment.id) ? payment : (payment && payment.data ? payment.data : null);
+          if (paymentRow && paymentRow.telegram_id) {
+            try { await bot.telegram.sendMessage(paymentRow.telegram_id, `Your payment #${paymentId} was rejected. Contact admin.`); } catch (_) {}
+          }
           return;
         } catch (e) {
           console.error('admin_reject err', e);
@@ -1372,7 +1414,7 @@ async function initBot() {
   async function sendCommentsPage(ctx, threadId, offset = 0, limit = 15) {
     try {
       const res = await safeDb.listCommentsByThread(threadId, offset, limit).catch(()=>({ data: [] }));
-      const data = (res && res.data) ? res.data : (Array.isArray(res) ? res : []);
+      const data = (Array.isArray(res) ? res : (res && res.data && Array.isArray(res.data) ? res.data : (Array.isArray(res.data) ? res.data : [])));
       if (!data || data.length === 0) return ctx.reply('No comments yet for this video.');
       for (const c of data) {
         try {
@@ -1425,8 +1467,9 @@ async function initBot() {
       if (!safeDb.supabase) return ctx.reply('Could not fetch your comments (DB missing).');
       const { data, error } = await safeDb.supabase.from('voice_comments').select('*').eq('telegram_id', ctx.from.id).order('created_at', { ascending: false }).limit(30);
       if (error) throw error;
-      if (!data || data.length === 0) return ctx.reply('You have no comments yet.');
-      for (const c of data) {
+      const rows = data || [];
+      if (!rows || rows.length === 0) return ctx.reply('You have no comments yet.');
+      for (const c of rows) {
         if (c.telegram_file_id) await ctx.replyWithVoice(c.telegram_file_id, { caption: `${c.first_name || c.username || 'You'} • ${new Date(c.created_at).toLocaleString()}` });
         else await ctx.reply('Comment: (no voice saved)');
         const inline = await buildActionsInline(c.id, ctx.from.id);
