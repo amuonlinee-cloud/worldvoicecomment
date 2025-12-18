@@ -1,4 +1,3 @@
-// src/bot.js
 // World Voice Comment — fixed: canonical lookups, balance decrement, replies reporting, favorites link, pending flow fixes
 
 const { Telegraf, Markup } = require('telegraf');
@@ -1275,59 +1274,9 @@ async function initBot() {
         const idx = Number(parts[1]);
         const pkg = PAYMENT_PACKAGES[idx];
         if (!pkg) { await ctx.answerCbQuery('Invalid package'); return; }
-
-        // mark intent quickly (keeps flow consistent)
         PendingMap.set(ctx.from.id, { type: 'buy_confirm', pkg });
-
-        // Answer callback quickly to remove spinner
         await ctx.answerCbQuery();
-
-        // Immediately send payment details and copy buttons so user can copy/paste without waiting.
-        (async () => {
-          try {
-            const pid = Math.floor(Math.random() * 100000);
-            const telebirr = '0962058608';
-            const cbeAcc = '1000555367884';
-            const bankText = `*Payment details*\n\nTELEBIRR: \`${telebirr}\` (AMANUEL DESSALEGN ASFAW)\nCBE Account: \`${cbeAcc}\` (AMANUEL DESSALEGN ASFAW)\n\nAmount: *${pkg.amount} ETB*\n\nAfter payment press "Upload Proof" below then send the screenshot/photo or paste the payment link.\nOr use: /payproof ${pid}`;
-
-            // send the details immediately
-            try { await ctx.replyWithMarkdown(bankText); } catch (e) { try { await ctx.reply(bankText); } catch (_) {} }
-
-            const inline = Markup.inlineKeyboard([
-              [ Markup.button.callback('Copy TELEBIRR', `copy_tel|${telebirr}`), Markup.button.callback('Copy CBE', `copy_acc|${cbeAcc}`) ],
-              [ Markup.button.callback('Upload Proof (photo/link)', `start_upload_proof|${pid}`) ],
-              [ Markup.button.url('Contact admin (WhatsApp)', `${WHATSAPP_LINK}?text=Payment%20for%20request%20${pid}`) ]
-            ]);
-
-            try { await ctx.reply('Payment options:', inline); } catch (e) { /* ignore */ }
-
-            // Create payment record in background (non-blocking) — attach the generated pid to help matching proof uploads
-            try {
-              safeDb.createPaymentRequest({
-                telegram_id: ctx.from.id,
-                package_name: pkg.label,
-                comments_amount: pkg.credits,
-                amount: pkg.amount,
-                method: 'manual',
-                status: 'pending',
-                // include client-side id if DB allows it; fallback will set its own id
-                client_pid: pid
-              }).catch((err) => { console.error('bg createPaymentRequest err', err); });
-            } catch (e) { console.error('safedb createPaymentRequest fire-and-forget err', e); }
-
-            // notify admins in background (non-blocking)
-            for (const adm of ADMIN_IDS) {
-              try {
-                const uname = ctx.from.username ? `@${ctx.from.username}` : (ctx.from.first_name || `${ctx.from.id}`);
-                bot.telegram.sendMessage(Number(adm), `🆕 New payment intent (client PID ${pid}) by ${ctx.from.id} (${uname}) — ${pkg.label}\nAmount: ${pkg.amount} ETB`).catch(()=>{});
-              } catch (e) { /* ignore admin notify errors */ }
-            }
-          } catch (e) {
-            console.error('immediate buypkg flow err', e);
-          }
-        })();
-
-        return;
+        return createPaymentRequestFlow(ctx, pkg);
       }
 
       if (cmd === 'contact_whatsapp') {
