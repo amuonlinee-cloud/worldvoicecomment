@@ -1,6 +1,6 @@
 // src/database.js
 // Supabase wrapper with an in-memory fallback when env is missing.
-// Adds user balance helpers and listing helpers so bot.js doesn't touch supabase directly.
+// Adds user balance helpers, listing helpers and setThreadCreator so bot.js doesn't touch supabase directly.
 
 const utils = require('./utils');
 
@@ -110,7 +110,13 @@ const mem = {
     const key = _normalizeLinkForKey(cand || link);
     if (state.threadsByLink.has(key)) {
       const id = state.threadsByLink.get(key);
-      return state.threads.get(id);
+      const t = state.threads.get(id);
+      // if owner provided and not set, set it
+      if (creatorTelegramId && (!t.creator_telegram_id || t.creator_telegram_id !== creatorTelegramId)) {
+        t.creator_telegram_id = creatorTelegramId;
+        state.threads.set(id, t);
+      }
+      return t;
     }
     const id = nextId('thread');
     const item = { id, social_link: link, canonical_link: (normalized && normalized.canonicalLink) ? normalized.canonicalLink : null, provider: normalized && normalized.provider ? normalized.provider : null, provider_id: normalized && normalized.id ? String(normalized.id) : null, creator_telegram_id: creatorTelegramId || null, created_at: new Date().toISOString() };
@@ -133,6 +139,14 @@ const mem = {
 
   getThreadById: async (id) => {
     return state.threads.get(Number(id)) || null;
+  },
+
+  setThreadCreator: async (threadId, telegramId) => {
+    const t = state.threads.get(Number(threadId));
+    if (!t) return null;
+    t.creator_telegram_id = telegramId;
+    state.threads.set(Number(threadId), t);
+    return t;
   },
 
   listThreadsByCreator: async (telegramId) => {
@@ -301,7 +315,6 @@ const api = {
   creditUser: async (telegramId, amount) => {
     if (!useSupabase || !api.supabase) return mem.creditUser(telegramId, amount);
     try {
-      // upsert user row if missing
       const { data: existing } = await api.supabase.from('users').select('telegram_id,free_comments').eq('telegram_id', telegramId).limit(1).maybeSingle();
       if (!existing) {
         const { data } = await api.supabase.from('users').insert([{ telegram_id: telegramId, free_comments: amount }]).select().maybeSingle();
@@ -324,7 +337,6 @@ const api = {
     try {
       const { data } = await api.supabase.from('users').select('free_comments').eq('telegram_id', telegramId).limit(1).maybeSingle();
       if (!data) {
-        // cannot decrement if user not present or zero
         return { error: 'not found or zero' };
       }
       const current = Number(data.free_comments || 0);
@@ -354,31 +366,46 @@ const api = {
       if (normalized && normalized.canonicalLink) candidates.push(String(normalized.canonicalLink).replace(/\/$/,''));
       const uniq = Array.from(new Set(candidates.filter(Boolean)));
 
-      // try canonical
       for (const cand of uniq) {
         try {
           const { data } = await api.supabase.from('threads').select('*').ilike('canonical_link', cand).limit(1).maybeSingle();
-          if (data) return data;
-        } catch (e) { /* ignore per-candidate error */ }
+          if (data) {
+            // ensure creator if provided
+            if (creatorTelegramId && (!data.creator_telegram_id || data.creator_telegram_id !== creatorTelegramId)) {
+              try { await api.supabase.from('threads').update({ creator_telegram_id: creatorTelegramId }).eq('id', data.id); } catch (e) {}
+              data.creator_telegram_id = creatorTelegramId;
+            }
+            return data;
+          }
+        } catch (e) { /* ignore per-candidate */ }
       }
 
-      // provider lookup
       if (provider && providerId) {
         try {
           const { data } = await api.supabase.from('threads').select('*').eq('provider', provider).eq('provider_id', providerId).limit(1).maybeSingle();
-          if (data) return data;
-        } catch (e) { /* ignore */ }
+          if (data) {
+            if (creatorTelegramId && (!data.creator_telegram_id || data.creator_telegram_id !== creatorTelegramId)) {
+              try { await api.supabase.from('threads').update({ creator_telegram_id: creatorTelegramId }).eq('id', data.id); } catch (e) {}
+              data.creator_telegram_id = creatorTelegramId;
+            }
+            return data;
+          }
+        } catch (e) {}
       }
 
-      // social_link lookup
       for (const cand of uniq) {
         try {
           const { data } = await api.supabase.from('threads').select('*').ilike('social_link', cand).limit(1).maybeSingle();
-          if (data) return data;
-        } catch (e) { /* ignore */ }
+          if (data) {
+            if (creatorTelegramId && (!data.creator_telegram_id || data.creator_telegram_id !== creatorTelegramId)) {
+              try { await api.supabase.from('threads').update({ creator_telegram_id: creatorTelegramId }).eq('id', data.id); } catch (e) {}
+              data.creator_telegram_id = creatorTelegramId;
+            }
+            return data;
+          }
+        } catch (e) {}
       }
 
-      // insert
       const insertRow = {
         social_link: link,
         canonical_link: (normalized && normalized.canonicalLink) ? normalized.canonicalLink : null,
@@ -411,7 +438,7 @@ const api = {
         try {
           const { data } = await api.supabase.from('threads').select('*').ilike('canonical_link', cand).limit(1).maybeSingle();
           if (data) return data;
-        } catch (e) { /* ignore per-candidate error */ }
+        } catch (e) { /* ignore per-candidate */ }
       }
       if (normalized && normalized.provider && normalized.id) {
         try {
@@ -442,6 +469,19 @@ const api = {
       console.error('[database] getThreadById supabase err', err && (err.message || err));
       if (isNetworkError(err)) markFallback(err);
       return mem.getThreadById(id);
+    }
+  },
+
+  setThreadCreator: async (threadId, telegramId) => {
+    if (!useSupabase || !api.supabase) return mem.setThreadCreator(threadId, telegramId);
+    try {
+      const { data, error } = await api.supabase.from('threads').update({ creator_telegram_id: telegramId }).eq('id', threadId).select().maybeSingle();
+      if (error) return { error };
+      return data || null;
+    } catch (err) {
+      console.error('[database] setThreadCreator supabase err', err && (err.message || err));
+      if (isNetworkError(err)) markFallback(err);
+      return mem.setThreadCreator(threadId, telegramId);
     }
   },
 
