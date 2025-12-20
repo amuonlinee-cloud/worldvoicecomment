@@ -1,3 +1,4 @@
+// src/bot.js
 // World Voice Comment — fixed: canonical lookups, balance decrement, replies reporting, favorites link, pending flow fixes
 
 const { Telegraf, Markup } = require('telegraf');
@@ -562,7 +563,12 @@ async function initBot() {
         amount: pkg.amount,
         method: 'manual',
         status: 'pending'
+      }).catch(err => {
+        // if createPaymentRequest throws, log but continue to send UI so user can still pay
+        console.error('createPaymentRequest (bg) err', err && err.message);
+        return null;
       });
+
       const requestRow = (created && created.data) ? created.data : created;
       const pid = requestRow && requestRow.id ? requestRow.id : Math.floor(Math.random() * 100000);
 
@@ -570,23 +576,30 @@ async function initBot() {
       const cbeAcc = '1000555367884';
       const bankText = `*Payment details*\n\nTELEBIRR: \`${telebirr}\` (AMANUEL DESSALEGN ASFAW)\nCBE Account: \`${cbeAcc}\` (AMANUEL DESSALEGN ASFAW)\n\nAmount: *${pkg.amount} ETB*\n\nAfter payment press "Upload Proof" below then send the screenshot/photo or paste the payment link.\nOr use: /payproof ${pid}`;
 
-      await ctx.replyWithMarkdown(bankText);
-
       const inline = Markup.inlineKeyboard([
         [ Markup.button.callback('Copy TELEBIRR', `copy_tel|${telebirr}`), Markup.button.callback('Copy CBE', `copy_acc|${cbeAcc}`) ],
         [ Markup.button.callback('Upload Proof (photo/link)', `start_upload_proof|${pid}`) ],
         [ Markup.button.url('Contact admin (WhatsApp)', `${WHATSAPP_LINK}?text=Payment%20for%20request%20${pid}`) ]
       ]);
 
-      await ctx.reply('Payment options:', inline);
-
-      // Notify admins with user mention-ish info
-      for (const adm of ADMIN_IDS) {
-        try {
-          const uname = ctx.from.username ? `@${ctx.from.username}` : (ctx.from.first_name || `${ctx.from.id}`);
-          await bot.telegram.sendMessage(Number(adm), `🆕 New payment request #${pid} by ${ctx.from.id} (${uname}) — ${pkg.label}\nAmount: ${pkg.amount} ETB`);
-        } catch (e) { console.error('notify admin createPayment', e); }
+      // Send details and inline keyboard together in the same message (so both show simultaneously)
+      try {
+        await ctx.replyWithMarkdown(bankText, { reply_markup: inline.reply_markup });
+      } catch (e) {
+        // fallback if replyWithMarkdown fails
+        try { await ctx.reply(bankText, inline); } catch (ee) { /* ignore */ }
       }
+
+      // notify admins in background (non-blocking)
+      (async () => {
+        for (const adm of ADMIN_IDS) {
+          try {
+            const uname = ctx.from.username ? `@${ctx.from.username}` : (ctx.from.first_name || `${ctx.from.id}`);
+            await bot.telegram.sendMessage(Number(adm), `🆕 New payment request (client pid ${pid}) by ${ctx.from.id} (${uname}) — ${pkg.label}\nAmount: ${pkg.amount} ETB`).catch(()=>{});
+          } catch (err) { /* ignore */ }
+        }
+      })();
+
       return;
     } catch (e) {
       console.error('createPaymentRequestFlow err', e);
@@ -675,12 +688,6 @@ async function initBot() {
         await ctx.reply('Could not submit report. Try again later.');
       }
       return;
-    }
-
-    if (p && p.type === 'search_prompt') {
-      PendingMap.delete(uid);
-      const code = textRaw.trim();
-      return handleSearchByCode(ctx, code);
     }
 
     if (p && p.type === 'reply_text') {
@@ -1274,9 +1281,20 @@ async function initBot() {
         const idx = Number(parts[1]);
         const pkg = PAYMENT_PACKAGES[idx];
         if (!pkg) { await ctx.answerCbQuery('Invalid package'); return; }
-        PendingMap.set(ctx.from.id, { type: 'buy_confirm', pkg });
-        await ctx.answerCbQuery();
-        return createPaymentRequestFlow(ctx, pkg);
+
+        // remove any spinner immediately
+        try { await ctx.answerCbQuery(); } catch (_) {}
+
+        // call the flow that sends payment details + inline together
+        try {
+          // mark pending (used if you want to confirm)
+          PendingMap.set(ctx.from.id, { type: 'buy_confirm', pkg });
+          return await createPaymentRequestFlow(ctx, pkg);
+        } catch (e) {
+          console.error('buypkg handler err', e);
+          await ctx.answerCbQuery('Error starting purchase');
+          return;
+        }
       }
 
       if (cmd === 'contact_whatsapp') {
