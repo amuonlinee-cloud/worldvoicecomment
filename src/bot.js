@@ -1,5 +1,5 @@
 // src/bot.js
-// World Voice Comment — updated to use safe DB methods for balances and listings
+// World Voice Comment — updated to ensure setThreadCreator and to auto-cancel pending flows when user switches actions
 
 const { Telegraf, Markup } = require('telegraf');
 const debugLog = (...args) => console.log('[bot]', ...args);
@@ -88,7 +88,7 @@ async function safeSend(fn, ...args) {
   try { return await fn(...args); } catch (e) { console.error('safeSend error', e && (e.stack || e)); return null; }
 }
 
-// new: unified getUserBalance using safeDb
+// unified getUserBalance using safeDb
 async function getUserBalance(telegramId) {
   try {
     if (!safeDb || !safeDb.getUserBalance) return 0;
@@ -99,7 +99,7 @@ async function getUserBalance(telegramId) {
   }
 }
 
-// new: unified credit and decrement wrappers using safeDb
+// unified credit and decrement wrappers using safeDb
 async function creditUser(telegramId, creditsToAdd) {
   try {
     if (!safeDb || !safeDb.creditUser) throw new Error('DB creditUser not available');
@@ -119,7 +119,7 @@ async function decrementUserBalance(telegramId, amount = 1) {
   }
 }
 
-// Reaction counts (unchanged but uses safeDb.reactions indirectly)
+// Reaction counts (unchanged)
 async function getReactionCounts(commentId) {
   try {
     if (safeDb && safeDb.supabase) {
@@ -237,7 +237,7 @@ async function handleNotificationsCommand(ctx) {
   }
 }
 
-// favorites listing helper (exposed to keyboard flow) — now includes the video link
+// favorites listing helper (exposed to keyboard flow)
 async function showFavoritesCommand(ctx) {
   try {
     const favRows = await safeDb.listFavoritesForUser(ctx.from.id);
@@ -248,14 +248,12 @@ async function showFavoritesCommand(ctx) {
       } else {
         await ctx.reply('Favorite comment (no voice stored).');
       }
-      // fetch thread for link (defensive)
       let videoLink = '(video unknown)';
       try {
         const thread = await safeDb.getThreadById(c.thread_id);
         if (thread) videoLink = thread.social_link || thread.canonical_link || videoLink;
       } catch (e) {}
       const inline = await buildActionsInline(c.id, ctx.from.id);
-      // send only the short code (no "Code:" label) and then the link
       await ctx.reply(utils.encodeShortCode(c.id), inline);
       await ctx.reply(`Video: ${videoLink}`);
     }
@@ -348,7 +346,7 @@ async function initBot() {
     }
   });
 
-  // createPaymentRequestFlow uses copy buttons + upload proof — unchanged except uses safeDb
+  // createPaymentRequestFlow uses copy buttons + upload proof
   async function createPaymentRequestFlow(ctx, pkg) {
     try {
       const created = await safeDb.createPaymentRequest({
@@ -406,7 +404,27 @@ async function initBot() {
     const textRaw = (ctx.message && ctx.message.text) || '';
     const text = utils.normalizeInput(textRaw);
     const uid = ctx.from && ctx.from.id;
-    const p = PendingMap.get(uid);
+    let p = PendingMap.get(uid);
+
+    // --- EARLY cancel: if user clicked a keyboard label, a slash command, or typed "cancel"/"ignore",
+    // cancel previous pending flows before processing them
+    const keyboardLabels = [
+      '🎥 add comment','➕ add my video','🔖 track video','🎧 listen comments',
+      '💬 my comments','🔎 search','⭐ favorites','🔔 notifications','🛒 buy','🆘 support','💰 balance'
+    ];
+    const nlower = normalizeKbLabel(text);
+    const isSlash = (textRaw || '').trim().startsWith('/');
+    const isCancel = ['cancel','ignore','back','exit'].includes((textRaw||'').trim().toLowerCase());
+    if (isSlash || isCancel || keyboardLabels.includes(nlower)) {
+      if (p) {
+        PendingMap.delete(uid);
+        p = null;
+      }
+    }
+    // --- end early cancel
+
+    // after early cancellation, continue with pending processing for cases where user actually intended to reply
+    p = PendingMap.get(uid);
 
     // process pending handlers first (so reply/photo/text flows are not accidentally cancelled)
     if (p && p.type === 'report_reason' && p.commentId) {
@@ -543,17 +561,18 @@ async function initBot() {
       PendingMap.delete(uid);
       try {
         await safeDb.ensureUserRow(ctx.from).catch(()=>null);
-        let thread = await safeDb.findOrCreateThread(url, p.type === 'create_thread_owned' ? ctx.from.id : null);
+        // pass creator id when user selected "Add My Video"
+        const creatorId = (p.type === 'create_thread_owned') ? ctx.from.id : null;
+        let thread = await safeDb.findOrCreateThread(url, creatorId);
         if (!thread) {
           await ctx.reply('✅ Thread created (fallback).', mainKeyboard());
           return;
         }
-        // If user explicitly asked to track the video, ensure creator_telegram_id is set
+        // ensure creator stored if requested and DB didn't set it on insert (best-effort)
         if (p.type === 'create_thread_owned') {
           try {
-            if (safeDb.supabase && thread && (!thread.creator_telegram_id || thread.creator_telegram_id !== ctx.from.id)) {
-              // try to update creator in DB; if this fails we ignore
-              await safeDb.supabase.from('threads').update({ creator_telegram_id: ctx.from.id }).eq('id', thread.id);
+            if (thread && thread.id) {
+              await safeDb.setThreadCreator(thread.id, ctx.from.id).catch(()=>null);
             }
           } catch (e) { /* ignore */ }
         }
@@ -577,7 +596,6 @@ async function initBot() {
       const url = utils.extractFirstUrl(textRaw);
       if (!url) return ctx.reply('I could not find a link in your message.');
       try {
-        // use database canonical-aware lookup
         const normalized = await utils.normalizeVideoUrl(url).catch(()=>({ canonicalLink: url }));
         let thread = null;
         if (normalized && normalized.canonicalLink) thread = await safeDb.getThreadByLink(normalized.canonicalLink);
@@ -593,18 +611,13 @@ async function initBot() {
       }
     }
 
-    // After pending processing, now check whether the user sent a keyboard label — cancel prior pending flows if they did.
-    const keyboardLabels = [
-      '🎥 add comment','➕ add my video','🔖 track video','🎧 listen comments',
-      '💬 my comments','🔎 search','⭐ favorites','🔔 notifications','🛒 buy','🆘 support','💰 balance'
-    ];
-    const nlower = normalizeKbLabel(text);
+    // After pending processing, now check whether the user sent a keyboard label — (this is safe too)
     if (keyboardLabels.includes(nlower)) {
       PendingMap.delete(uid);
     }
 
     // Keyboard flows
-    const n = normalizeKbLabel(text);
+    const n = nlower;
     if (n === normalizeKbLabel('🎥 add comment')) {
       PendingMap.set(uid, { type: 'create_thread_public' });
       return ctx.reply('Send TikTok/YouTube link for which you want to add a comment (or press a tracked video).');
@@ -615,7 +628,6 @@ async function initBot() {
     }
     if (n === normalizeKbLabel('🔖 track video')) {
       try {
-        // Use safeDb.listThreadsByCreator
         const rows = await safeDb.listThreadsByCreator(ctx.from.id);
         if (!rows || rows.length === 0) return ctx.reply('You have no tracked videos.');
         for (const t of rows) {
@@ -636,7 +648,6 @@ async function initBot() {
       return ctx.reply('Send a TikTok/YouTube link or click a tracked video to listen comments.');
     }
     if (n === normalizeKbLabel('💬 my comments')) {
-      // show comments via safeDb.listCommentsByUser
       return handleMyComments(ctx);
     }
     if (n === normalizeKbLabel('⭐ favorites')) {
@@ -683,7 +694,8 @@ async function initBot() {
     }
 
     // handle search input (short code)
-    if (p && p.type === 'search_prompt') {
+    const pAfter = PendingMap.get(uid);
+    if (pAfter && pAfter.type === 'search_prompt') {
       PendingMap.delete(uid);
       const code = textRaw.trim();
       return handleSearchByCode(ctx, code);
@@ -770,7 +782,6 @@ async function initBot() {
         }
       } catch (e) {
         console.error('balance check err before add_comment', e);
-        // If balance check fails, block to be safe
         return ctx.reply('Could not verify your balance. Try again later or contact support.');
       }
 
@@ -798,7 +809,6 @@ async function initBot() {
           const dec = await decrementUserBalance(ctx.from.id, 1).catch(err => ({ error: err && err.message }));
           if (dec && dec.error) {
             console.error('decrementUserBalance reported error', dec);
-            // notify user but do not remove saved comment (admin can adjust)
             try { await ctx.reply('Note: could not decrement your balance (admin will review).'); } catch (_) {}
           }
         } catch (e) {
@@ -1033,8 +1043,7 @@ async function initBot() {
             const { error } = await safeDb.supabase.from('voice_comments').delete().eq('id', commentId);
             if (error) throw error;
           } else {
-            // mem fallback: delete if present
-            try { await safeDb.updatePaymentStatus; } catch (_) {}
+            try { /* mem fallback delete */ state && null; } catch (_) {}
           }
           await ctx.answerCbQuery('Comment deleted');
           return ctx.reply(`Comment #${commentId} deleted by admin.`);
@@ -1059,8 +1068,7 @@ async function initBot() {
             const { error } = await safeDb.supabase.from('voice_comments').delete().eq('id', commentId);
             if (error) throw error;
           } else {
-            // mem fallback delete
-            try { /* best-effort */ } catch (_) {}
+            try { /* mem fallback */ } catch (_) {}
           }
           await ctx.answerCbQuery('Deleted');
           return ctx.reply('Comment deleted.');
@@ -1145,13 +1153,11 @@ async function initBot() {
           const up = await safeDb.updatePaymentStatus(paymentId, 'approved');
           if (up && up.error) throw up.error;
 
-          // NEW: credit user via safeDb.creditUser
           const credits = Number(payment.comments_amount || 0) || 0;
           try {
             await safeDb.creditUser(payment.telegram_id, credits);
           } catch (e) {
             console.error('admin_approve creditUser err', e);
-            // still inform admin but note failure
             await ctx.answerCbQuery('Payment approved but crediting failed (admin must credit manually)');
             try { await bot.telegram.sendMessage(payment.telegram_id, `Your payment #${paymentId} was approved but we could not credit your account automatically. Contact admin.`); } catch (_) {}
             return;
