@@ -1,6 +1,6 @@
 // src/database.js
 // Supabase wrapper with an in-memory fallback when env is missing.
-// Adds user balance helpers, listing helpers and setThreadCreator so bot.js doesn't touch supabase directly.
+// Adds reaction and reporting helpers, plus thread creator setter.
 
 const utils = require('./utils');
 
@@ -30,7 +30,8 @@ const state = {
   favorites: new Map(),
   reactions: new Map(),
   notifications: new Map(),
-  counters: { thread: 1000, comment: 10000, reply: 50000, payment: 90000 }
+  reports: new Map(),
+  counters: { thread: 1000, comment: 10000, reply: 50000, payment: 90000, reaction: 400000, report: 800000 }
 };
 
 function nextId(kind) {
@@ -39,6 +40,8 @@ function nextId(kind) {
   if (kind === 'comment') return ++c.comment;
   if (kind === 'reply') return ++c.reply;
   if (kind === 'payment') return ++c.payment;
+  if (kind === 'reaction') return ++c.reaction;
+  if (kind === 'report') return ++c.report;
   return Date.now();
 }
 function _normalizeLinkForKey(l) {
@@ -61,7 +64,7 @@ function _ensureMemUser(telegramId, userObj = {}) {
   return u;
 }
 
-// Build an in-memory API (same signatures as supabase-backed functions)
+// In-memory implementation
 const mem = {
   supabase: null,
 
@@ -111,7 +114,6 @@ const mem = {
     if (state.threadsByLink.has(key)) {
       const id = state.threadsByLink.get(key);
       const t = state.threads.get(id);
-      // if owner provided and not set, set it
       if (creatorTelegramId && (!t.creator_telegram_id || t.creator_telegram_id !== creatorTelegramId)) {
         t.creator_telegram_id = creatorTelegramId;
         state.threads.set(id, t);
@@ -208,6 +210,7 @@ const mem = {
     return Array.from(state.replies.values()).filter(r => Number(r.comment_id) === Number(commentId)).sort((a,b)=> new Date(a.created_at) - new Date(b.created_at));
   },
 
+  // favorites
   toggleFavoriteRow: async (telegramId, commentId) => {
     const key = `${telegramId}:${commentId}`;
     if (state.favorites.has(key)) { state.favorites.delete(key); return { removed: true }; }
@@ -219,11 +222,38 @@ const mem = {
     return state.favorites.has(`${telegramId}:${commentId}`);
   },
 
-  insertReactionRow: async (payload) => {
-    const id = Date.now();
-    const row = Object.assign({}, payload, { id, created_at: new Date().toISOString() });
-    state.reactions.set(row.id, row);
-    return row;
+  // reactions: enforce 1 reaction per user per comment
+  toggleReaction: async (telegramId, commentId, type) => {
+    // remove other reactions by this user on this comment, or toggle off if same type
+    const list = Array.from(state.reactions.values()).filter(r => Number(r.comment_id) === Number(commentId) && String(r.telegram_id) === String(telegramId));
+    if (list.length > 0) {
+      const existing = list[0];
+      if (existing.type === type) {
+        // remove (toggle off)
+        state.reactions.delete(existing.id);
+        return { removed: true, type };
+      } else {
+        // update type
+        existing.type = type;
+        existing.created_at = new Date().toISOString();
+        state.reactions.set(existing.id, existing);
+        return { updated: true, type };
+      }
+    } else {
+      const id = nextId('reaction');
+      const r = { id, comment_id: commentId, telegram_id: telegramId, type, created_at: new Date().toISOString() };
+      state.reactions.set(id, r);
+      return { added: true, type };
+    }
+  },
+
+  getReactionCounts: async (commentId) => {
+    const arr = Array.from(state.reactions.values()).filter(r => Number(r.comment_id) === Number(commentId));
+    const counts = { heart: 0, laugh: 0, dislike: 0 };
+    for (const r of arr) {
+      counts[r.type] = (counts[r.type] || 0) + 1;
+    }
+    return counts;
   },
 
   listFavoritesForUser: async (telegramId) => {
@@ -247,10 +277,36 @@ const mem = {
   setAdminNotifier: async (text, meta) => {
     const id = Date.now();
     state.notifications.set(id, { id, telegram_id: null, message: text, meta: meta || {}, created_at: new Date().toISOString() });
+  },
+
+  // reporting
+  insertReport: async (payload) => {
+    const id = nextId('report');
+    const r = Object.assign({ id, status: 'open', created_at: new Date().toISOString() }, payload);
+    state.reports.set(id, r);
+    return r;
+  },
+
+  listReports: async (filter = {}) => {
+    const arr = Array.from(state.reports.values());
+    // simple filter by status or target comment_id/reply_id
+    let out = arr;
+    if (filter.status) out = out.filter(r => r.status === filter.status);
+    if (filter.comment_id) out = out.filter(r => Number(r.comment_id) === Number(filter.comment_id));
+    if (filter.reply_id) out = out.filter(r => Number(r.reply_id) === Number(filter.reply_id));
+    return out.sort((a,b)=> new Date(b.created_at) - new Date(a.created_at));
+  },
+
+  getReportById: async (id) => {
+    return state.reports.get(Number(id)) || null;
+  },
+
+  deleteReport: async (id) => {
+    return state.reports.delete(Number(id));
   }
 };
 
-// If supabase envs present, create client
+// Try to create supabase client if envs present
 if (useSupabase) {
   try {
     const { createClient } = require('@supabase/supabase-js');
@@ -268,7 +324,7 @@ function isNetworkError(err) {
   return m.toLowerCase().includes('fetch failed') || m.toLowerCase().includes('network') || m.toLowerCase().includes('undici');
 }
 
-// Wrapper that attempts supabase, but on network/fetch failure switches to fallback for subsequent calls
+// API wrapper that uses Supabase when available, otherwise mem
 const api = {
   supabase: _supabase,
 
@@ -353,6 +409,7 @@ const api = {
     }
   },
 
+  // threads
   findOrCreateThread: async (link, creatorTelegramId = null) => {
     if (!useSupabase || !api.supabase) return mem.findOrCreateThread(link, creatorTelegramId);
     try {
@@ -370,7 +427,6 @@ const api = {
         try {
           const { data } = await api.supabase.from('threads').select('*').ilike('canonical_link', cand).limit(1).maybeSingle();
           if (data) {
-            // ensure creator if provided
             if (creatorTelegramId && (!data.creator_telegram_id || data.creator_telegram_id !== creatorTelegramId)) {
               try { await api.supabase.from('threads').update({ creator_telegram_id: creatorTelegramId }).eq('id', data.id); } catch (e) {}
               data.creator_telegram_id = creatorTelegramId;
@@ -617,6 +673,7 @@ const api = {
     }
   },
 
+  // favorites...
   toggleFavoriteRow: async (telegramId, commentId) => {
     if (!useSupabase || !api.supabase) return mem.toggleFavoriteRow(telegramId, commentId);
     try {
@@ -647,17 +704,47 @@ const api = {
     }
   },
 
-  insertReactionRow: async (payload) => {
-    if (!useSupabase || !api.supabase) return mem.insertReactionRow(payload);
+  // reactions: toggle + counts
+  toggleReaction: async (telegramId, commentId, type) => {
+    if (!useSupabase || !api.supabase) return mem.toggleReaction(telegramId, commentId, type);
     try {
-      const row = Object.assign({}, payload, { created_at: new Date().toISOString() });
-      const { data, error } = await api.supabase.from('reactions').insert([row]).select().maybeSingle();
-      if (error) return { error };
-      return data;
+      // find existing reaction by this user on this comment
+      const { data: existing } = await api.supabase.from('reactions').select('*').eq('comment_id', commentId).eq('telegram_id', telegramId).limit(1).maybeSingle();
+      if (existing) {
+        if (existing.type === type) {
+          // remove
+          await api.supabase.from('reactions').delete().eq('id', existing.id);
+          return { removed: true, type };
+        } else {
+          // update
+          const { data } = await api.supabase.from('reactions').update({ type }).eq('id', existing.id).select().maybeSingle();
+          return { updated: true, type };
+        }
+      } else {
+        const { data } = await api.supabase.from('reactions').insert([{ comment_id: commentId, telegram_id: telegramId, type }]).select().maybeSingle();
+        return { added: true, type };
+      }
     } catch (err) {
-      console.error('[database] insertReactionRow supabase err', err && (err.message || err));
+      console.error('[database] toggleReaction supabase err', err && (err.message || err));
       if (isNetworkError(err)) markFallback(err);
-      return mem.insertReactionRow(payload);
+      return mem.toggleReaction(telegramId, commentId, type);
+    }
+  },
+
+  getReactionCounts: async (commentId) => {
+    if (!useSupabase || !api.supabase) return mem.getReactionCounts(commentId);
+    try {
+      // aggregate counts
+      const { data, error } = await api.supabase.from('reactions').select('type', { count: 'exact' }).eq('comment_id', commentId);
+      // supabase JS doesn't return grouped counts easily here — do simple select
+      const { data: all } = await api.supabase.from('reactions').select('type').eq('comment_id', commentId);
+      const counts = { heart: 0, laugh: 0, dislike: 0 };
+      (all || []).forEach(r => { counts[r.type] = (counts[r.type] || 0) + 1; });
+      return counts;
+    } catch (err) {
+      console.error('[database] getReactionCounts supabase err', err && (err.message || err));
+      if (isNetworkError(err)) markFallback(err);
+      return mem.getReactionCounts(commentId);
     }
   },
 
@@ -709,8 +796,64 @@ const api = {
       if (isNetworkError(err)) markFallback(err);
       return mem.setAdminNotifier(text, meta);
     }
+  },
+
+  // reporting (supabase)
+  insertReport: async (payload) => {
+    if (!useSupabase || !api.supabase) return mem.insertReport(payload);
+    try {
+      const row = Object.assign({ status: 'open', created_at: new Date().toISOString() }, payload);
+      const { data, error } = await api.supabase.from('reports').insert([row]).select().maybeSingle();
+      if (error) return { error };
+      return data;
+    } catch (err) {
+      console.error('[database] insertReport supabase err', err && (err.message || err));
+      if (isNetworkError(err)) markFallback(err);
+      return mem.insertReport(payload);
+    }
+  },
+
+  listReports: async (filter = {}) => {
+    if (!useSupabase || !api.supabase) return mem.listReports(filter);
+    try {
+      let q = api.supabase.from('reports').select('*').order('created_at', { ascending: false }).limit(50);
+      if (filter.status) q = q.eq('status', filter.status);
+      if (filter.comment_id) q = q.eq('comment_id', filter.comment_id);
+      if (filter.reply_id) q = q.eq('reply_id', filter.reply_id);
+      const { data, error } = await q;
+      if (error) return [];
+      return data || [];
+    } catch (err) {
+      console.error('[database] listReports supabase err', err && (err.message || err));
+      if (isNetworkError(err)) markFallback(err);
+      return mem.listReports(filter);
+    }
+  },
+
+  getReportById: async (id) => {
+    if (!useSupabase || !api.supabase) return mem.getReportById(id);
+    try {
+      const { data } = await api.supabase.from('reports').select('*').eq('id', id).limit(1).maybeSingle();
+      return data || null;
+    } catch (err) {
+      console.error('[database] getReportById supabase err', err && (err.message || err));
+      if (isNetworkError(err)) markFallback(err);
+      return mem.getReportById(id);
+    }
+  },
+
+  deleteReport: async (id) => {
+    if (!useSupabase || !api.supabase) return mem.deleteReport(id);
+    try {
+      const { error } = await api.supabase.from('reports').delete().eq('id', id);
+      if (error) return { error };
+      return { deleted: true };
+    } catch (err) {
+      console.error('[database] deleteReport supabase err', err && (err.message || err));
+      if (isNetworkError(err)) markFallback(err);
+      return mem.deleteReport(id);
+    }
   }
 };
 
-// Export the api
 module.exports = api;
