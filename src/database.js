@@ -1,6 +1,6 @@
 // src/database.js
 // Supabase wrapper with an in-memory fallback when env is missing.
-// Adds reaction and reporting helpers, plus thread creator setter.
+// Adds deletion and reply helpers, reaction and reporting helpers, plus thread creator setter.
 
 const utils = require('./utils');
 
@@ -49,7 +49,7 @@ function _normalizeLinkForKey(l) {
   try { return String(l).trim().replace(/[)\]\.]+$/g, '').toLowerCase().replace(/\/$/,''); } catch (e) { return String(l); }
 }
 
-// Mem-only helpers for users (free_comments)
+// Mem-only helpers for users
 function _ensureMemUser(telegramId, userObj = {}) {
   const key = String(telegramId);
   let u = state.users.get(key);
@@ -57,14 +57,12 @@ function _ensureMemUser(telegramId, userObj = {}) {
     u = Object.assign({ telegram_id: telegramId, username: null, first_name: null, free_comments: 0, created_at: new Date().toISOString() }, userObj);
     state.users.set(key, u);
   } else {
-    // merge
     Object.assign(u, userObj);
     state.users.set(key, u);
   }
   return u;
 }
 
-// In-memory implementation
 const mem = {
   supabase: null,
 
@@ -210,6 +208,10 @@ const mem = {
     return Array.from(state.replies.values()).filter(r => Number(r.comment_id) === Number(commentId)).sort((a,b)=> new Date(a.created_at) - new Date(b.created_at));
   },
 
+  getReplyById: async (id) => {
+    return state.replies.get(Number(id)) || null;
+  },
+
   // favorites
   toggleFavoriteRow: async (telegramId, commentId) => {
     const key = `${telegramId}:${commentId}`;
@@ -224,16 +226,13 @@ const mem = {
 
   // reactions: enforce 1 reaction per user per comment
   toggleReaction: async (telegramId, commentId, type) => {
-    // remove other reactions by this user on this comment, or toggle off if same type
     const list = Array.from(state.reactions.values()).filter(r => Number(r.comment_id) === Number(commentId) && String(r.telegram_id) === String(telegramId));
     if (list.length > 0) {
       const existing = list[0];
       if (existing.type === type) {
-        // remove (toggle off)
         state.reactions.delete(existing.id);
         return { removed: true, type };
       } else {
-        // update type
         existing.type = type;
         existing.created_at = new Date().toISOString();
         state.reactions.set(existing.id, existing);
@@ -289,7 +288,6 @@ const mem = {
 
   listReports: async (filter = {}) => {
     const arr = Array.from(state.reports.values());
-    // simple filter by status or target comment_id/reply_id
     let out = arr;
     if (filter.status) out = out.filter(r => r.status === filter.status);
     if (filter.comment_id) out = out.filter(r => Number(r.comment_id) === Number(filter.comment_id));
@@ -303,6 +301,39 @@ const mem = {
 
   deleteReport: async (id) => {
     return state.reports.delete(Number(id));
+  },
+
+  // Deletion helpers (mem)
+  deleteCommentById: async (id) => {
+    const mid = Number(id);
+    return state.voice_comments.delete(mid);
+  },
+
+  deleteReplyById: async (id) => {
+    const mid = Number(id);
+    return state.replies.delete(mid);
+  },
+
+  deleteThreadById: async (id) => {
+    const tid = Number(id);
+    // remove thread and its link mapping
+    const t = state.threads.get(tid);
+    if (t) {
+      // remove from threadsByLink
+      const key = _normalizeLinkForKey(t.canonical_link || t.social_link || '');
+      if (state.threadsByLink.has(key) && state.threadsByLink.get(key) === tid) state.threadsByLink.delete(key);
+      state.threads.delete(tid);
+    }
+    // remove related comments & replies
+    for (const [cid, c] of Array.from(state.voice_comments.entries())) {
+      if (Number(c.thread_id) === tid) {
+        state.voice_comments.delete(cid);
+        for (const [rid, r] of Array.from(state.replies.entries())) {
+          if (Number(r.comment_id) === Number(cid)) state.replies.delete(rid);
+        }
+      }
+    }
+    return true;
   }
 };
 
@@ -317,16 +348,17 @@ if (useSupabase) {
   }
 }
 
-// Helper to detect network/fetch errors and switch to fallback
 function isNetworkError(err) {
   if (!err) return false;
   const m = String(err && (err.message || err));
   return m.toLowerCase().includes('fetch failed') || m.toLowerCase().includes('network') || m.toLowerCase().includes('undici');
 }
 
-// API wrapper that uses Supabase when available, otherwise mem
+// API wrapper
 const api = {
   supabase: _supabase,
+  mode: useSupabase ? 'supabase' : 'memory',
+  isUsingSupabase: () => useSupabase,
 
   ensureUserRow: async (user) => {
     if (!useSupabase || !api.supabase) return mem.ensureUserRow(user);
@@ -673,6 +705,18 @@ const api = {
     }
   },
 
+  getReplyById: async (id) => {
+    if (!useSupabase || !api.supabase) return mem.getReplyById(id);
+    try {
+      const { data } = await api.supabase.from('replies').select('*').eq('id', id).limit(1).maybeSingle();
+      return data || null;
+    } catch (err) {
+      console.error('[database] getReplyById supabase err', err && (err.message || err));
+      if (isNetworkError(err)) markFallback(err);
+      return mem.getReplyById(id);
+    }
+  },
+
   // favorites...
   toggleFavoriteRow: async (telegramId, commentId) => {
     if (!useSupabase || !api.supabase) return mem.toggleFavoriteRow(telegramId, commentId);
@@ -708,15 +752,12 @@ const api = {
   toggleReaction: async (telegramId, commentId, type) => {
     if (!useSupabase || !api.supabase) return mem.toggleReaction(telegramId, commentId, type);
     try {
-      // find existing reaction by this user on this comment
       const { data: existing } = await api.supabase.from('reactions').select('*').eq('comment_id', commentId).eq('telegram_id', telegramId).limit(1).maybeSingle();
       if (existing) {
         if (existing.type === type) {
-          // remove
           await api.supabase.from('reactions').delete().eq('id', existing.id);
           return { removed: true, type };
         } else {
-          // update
           const { data } = await api.supabase.from('reactions').update({ type }).eq('id', existing.id).select().maybeSingle();
           return { updated: true, type };
         }
@@ -734,9 +775,6 @@ const api = {
   getReactionCounts: async (commentId) => {
     if (!useSupabase || !api.supabase) return mem.getReactionCounts(commentId);
     try {
-      // aggregate counts
-      const { data, error } = await api.supabase.from('reactions').select('type', { count: 'exact' }).eq('comment_id', commentId);
-      // supabase JS doesn't return grouped counts easily here — do simple select
       const { data: all } = await api.supabase.from('reactions').select('type').eq('comment_id', commentId);
       const counts = { heart: 0, laugh: 0, dislike: 0 };
       (all || []).forEach(r => { counts[r.type] = (counts[r.type] || 0) + 1; });
@@ -853,7 +891,56 @@ const api = {
       if (isNetworkError(err)) markFallback(err);
       return mem.deleteReport(id);
     }
-  }
+  },
+
+  // Deletion helpers (supabase)
+  deleteCommentById: async (id) => {
+    if (!useSupabase || !api.supabase) return mem.deleteCommentById(id);
+    try {
+      const { error } = await api.supabase.from('voice_comments').delete().eq('id', id);
+      if (error) return { error };
+      // also delete replies for that comment
+      await api.supabase.from('replies').delete().eq('comment_id', id);
+      return { deleted: true };
+    } catch (err) {
+      console.error('[database] deleteCommentById supabase err', err && (err.message || err));
+      if (isNetworkError(err)) markFallback(err);
+      return mem.deleteCommentById(id);
+    }
+  },
+
+  deleteReplyById: async (id) => {
+    if (!useSupabase || !api.supabase) return mem.deleteReplyById(id);
+    try {
+      const { error } = await api.supabase.from('replies').delete().eq('id', id);
+      if (error) return { error };
+      return { deleted: true };
+    } catch (err) {
+      console.error('[database] deleteReplyById supabase err', err && (err.message || err));
+      if (isNetworkError(err)) markFallback(err);
+      return mem.deleteReplyById(id);
+    }
+  },
+
+  deleteThreadById: async (id) => {
+    if (!useSupabase || !api.supabase) return mem.deleteThreadById(id);
+    try {
+      // delete thread, its comments and replies
+      await api.supabase.from('replies').delete().in('comment_id', api.supabase.from('voice_comments').select('id').eq('thread_id', id));
+      const { error: e2 } = await api.supabase.from('voice_comments').delete().eq('thread_id', id);
+      if (e2) return { error: e2 };
+      const { error } = await api.supabase.from('threads').delete().eq('id', id);
+      if (error) return { error };
+      return { deleted: true };
+    } catch (err) {
+      console.error('[database] deleteThreadById supabase err', err && (err.message || err));
+      if (isNetworkError(err)) markFallback(err);
+      return mem.deleteThreadById(id);
+    }
+  },
+
+  // expose mem helper for debugging
+  _mem_state: () => state
 };
 
 module.exports = api;
