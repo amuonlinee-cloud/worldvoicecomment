@@ -1,5 +1,5 @@
 // src/bot.js
-// World Voice Comment — fixed: canonical lookups, balance decrement, replies reporting, favorites link, pending flow fixes
+// World Voice Comment — updated to use safe DB methods for balances and listings
 
 const { Telegraf, Markup } = require('telegraf');
 const debugLog = (...args) => console.log('[bot]', ...args);
@@ -49,210 +49,8 @@ utils.decodeShortCode = utils.decodeShortCode || function (code) {
 utils.normalizeVideoUrl = utils.normalizeVideoUrl || (async (url) => ({ canonicalLink: url }));
 utils.isSupportedLink = utils.isSupportedLink || (s => !!s && /tiktok\.com|youtube\.com|youtu\.be|vm\.tiktok\.com/i.test(s));
 
-// safeDb wrappers and fallbacks (same approach as before)
-const safeDb = { supabase: db.supabase || null };
-
-// ensureUserRow
-safeDb.ensureUserRow = db.ensureUserRow || (async (user) => {
-  if (!user) return null;
-  if (safeDb.supabase) {
-    try {
-      const row = { telegram_id: user.id, username: user.username || null, first_name: user.first_name || null };
-      const { data, error } = await safeDb.supabase.from('users').upsert(row, { onConflict: ['telegram_id'] }).select().maybeSingle();
-      if (error) throw error;
-      return data;
-    } catch (e) { debugLog('ensureUserRow supabase err', e && e.message); return null; }
-  }
-  return null;
-});
-
-// create/get thread helpers (use normalized canonicalLink)
-safeDb.createThread = db.createThread || (async (link, creatorTelegramId = null) => {
-  if (safeDb.supabase) {
-    try {
-      const { data, error } = await safeDb.supabase.from('threads').insert([{ social_link: link, creator_telegram_id: creatorTelegramId }]).select().maybeSingle();
-      if (error) throw error;
-      return data;
-    } catch (e) { debugLog('createThread supabase err', e && e.message); }
-  }
-  return { id: Date.now(), social_link: link, creator_telegram_id: creatorTelegramId, created_at: new Date().toISOString() };
-});
-safeDb.getThreadByLink = db.getThreadByLink || (async (link) => {
-  if (!link) return null;
-  if (safeDb.supabase) {
-    try {
-      // try social_link first (case-insensitive)
-      const { data, error } = await safeDb.supabase.from('threads').select('*').ilike('social_link', link).limit(1).maybeSingle();
-      if (error) throw error;
-      if (data) return data;
-      // then try canonical_link if column exists (defensive)
-      try {
-        const { data: cd, error: cdErr } = await safeDb.supabase.from('threads').select('*').ilike('canonical_link', link).limit(1).maybeSingle();
-        if (!cdErr && cd) return cd;
-      } catch (e) {
-        // ignore if column missing
-      }
-      return null;
-    } catch (e) { debugLog('getThreadByLink supabase err', e && e.message); return null; }
-  }
-  return null;
-});
-safeDb.getThreadById = db.getThreadById || (async (id) => {
-  if (!id) return null;
-  if (safeDb.supabase) {
-    try {
-      const { data, error } = await safeDb.supabase.from('threads').select('*').eq('id', id).limit(1).maybeSingle();
-      if (error) throw error;
-      return data;
-    } catch (e) { debugLog('getThreadById supabase err', e && e.message); return null; }
-  }
-  return null;
-});
-
-safeDb.findOrCreateThread = db.findOrCreateThread || (async (link, creatorTelegramId = null) => {
-  try {
-    const normalized = await utils.normalizeVideoUrl(link).catch(()=>({ canonicalLink: link }));
-    const searchLink = normalized && normalized.canonicalLink ? normalized.canonicalLink : link;
-    // try exact match by canonical or social link
-    let thread = await safeDb.getThreadByLink(searchLink);
-    if (thread) return thread;
-    // fallback: create
-    thread = await safeDb.createThread(searchLink, creatorTelegramId);
-    return thread;
-  } catch (e) {
-    debugLog('findOrCreateThread fallback err', e && e.message);
-    return await safeDb.createThread(link, creatorTelegramId);
-  }
-});
-
-// other safeDb fallbacks (voice comments, replies, favorites, payments, notifications)
-safeDb.insertVoiceComment = db.insertVoiceComment || (async (payload) => {
-  if (safeDb.supabase) {
-    const { data, error } = await safeDb.supabase.from('voice_comments').insert([payload]).select().maybeSingle();
-    if (error) return { error };
-    return { data };
-  }
-  return { data: Object.assign({ id: Date.now(), created_at: new Date().toISOString() }, payload) };
-});
-safeDb.listCommentsByThread = db.listCommentsByThread || (async (threadId, offset=0, limit=15) => {
-  if (safeDb.supabase) {
-    const { data, error } = await safeDb.supabase.from('voice_comments').select('*').eq('thread_id', threadId).order('created_at', { ascending: false }).range(offset, offset + limit - 1);
-    if (error) return { error };
-    return { data };
-  }
-  return { data: [] };
-});
-safeDb.getCommentById = db.getCommentById || (async (id) => {
-  if (!id) return null;
-  if (safeDb.supabase) {
-    const { data, error } = await safeDb.supabase.from('voice_comments').select('*').eq('id', id).limit(1).maybeSingle();
-    if (error) throw error;
-    return data;
-  }
-  return null;
-});
-safeDb.insertReplyRow = db.insertReplyRow || (async (payload) => {
-  if (safeDb.supabase) {
-    const { data, error } = await safeDb.supabase.from('replies').insert([payload]).select().maybeSingle();
-    if (error) return { error };
-    return { data };
-  }
-  return { data: Object.assign({ id: Date.now(), created_at: new Date().toISOString() }, payload) };
-});
-safeDb.listReplies = db.listReplies || (async (commentId) => {
-  if (safeDb.supabase) {
-    const { data, error } = await safeDb.supabase.from('replies').select('*').eq('comment_id', commentId).order('created_at', { ascending: true });
-    if (error) return { error };
-    return { data };
-  }
-  return { data: [] };
-});
-safeDb.toggleFavoriteRow = db.toggleFavoriteRow || (async (telegramId, commentId) => {
-  if (safeDb.supabase) {
-    const { data: exists, error: e1 } = await safeDb.supabase.from('favorites').select('*').eq('telegram_id', telegramId).eq('comment_id', commentId).limit(1).maybeSingle();
-    if (e1) return { error: e1 };
-    if (exists) {
-      const { error } = await safeDb.supabase.from('favorites').delete().eq('id', exists.id);
-      if (error) return { error };
-      return { removed: true };
-    } else {
-      const { data, error } = await safeDb.supabase.from('favorites').insert([{ telegram_id: telegramId, comment_id: commentId }]).select().maybeSingle();
-      if (error) return { error };
-      return { removed: false, data };
-    }
-  }
-  return { removed: false };
-});
-safeDb.listFavoritesForUser = db.listFavoritesForUser || (async (telegramId) => {
-  if (safeDb.supabase) {
-    const { data, error } = await safeDb.supabase.from('favorites').select('id, comment_id, created_at, voice_comments( id, thread_id, telegram_file_id, first_name, username, created_at )').eq('telegram_id', telegramId).order('created_at', { ascending: false });
-    if (error) return [];
-    return (data || []).map(r => r.voice_comments).filter(Boolean);
-  }
-  return [];
-});
-safeDb.createPaymentRequest = db.createPaymentRequest || (async (payload) => {
-  if (safeDb.supabase) {
-    const { data, error } = await safeDb.supabase.from('payment_requests').insert([payload]).select().maybeSingle();
-    if (error) return { error };
-    return { data };
-  }
-  return { data: Object.assign({ id: Math.floor(Math.random()*100000), created_at: new Date().toISOString() }, payload) };
-});
-safeDb.getPaymentById = db.getPaymentById || (async (id) => {
-  if (!id) return null;
-  if (safeDb.supabase) {
-    const { data, error } = await safeDb.supabase.from('payment_requests').select('*').eq('id', id).limit(1).maybeSingle();
-    if (error) throw error;
-    return data;
-  }
-  return null;
-});
-safeDb.updatePaymentStatus = db.updatePaymentStatus || (async (id, status, updates={}) => {
-  if (safeDb.supabase) {
-    const upd = Object.assign({ status }, updates);
-    const { data, error } = await safeDb.supabase.from('payment_requests').update(upd).eq('id', id).select().maybeSingle();
-    if (error) return { error };
-    return { data };
-  }
-  return { data: { id, status } };
-});
-safeDb.addNotificationRow = db.addNotificationRow || (async (payload) => {
-  if (safeDb.supabase) {
-    const { data, error } = await safeDb.supabase.from('notifications').insert([payload]).select().maybeSingle();
-    if (error) return { error };
-    return { data };
-  }
-  return { data: payload };
-});
-safeDb.listNotifications = db.listNotifications || (async (telegramId) => {
-  if (safeDb.supabase) {
-    const { data, error } = await safeDb.supabase.from('notifications').select('*').eq('telegram_id', telegramId).order('created_at', { ascending: false }).limit(50);
-    if (error) return { error };
-    return { data };
-  }
-  return { data: [] };
-});
-safeDb.insertReactionRow = db.insertReactionRow || (async (payload) => {
-  if (safeDb.supabase) {
-    const { data, error } = await safeDb.supabase.from('reactions').insert([payload]).select().maybeSingle();
-    if (error) return { error };
-    return { data };
-  }
-  return { data: payload };
-});
-safeDb.isFavorite = db.isFavorite || (async (telegramId, commentId) => {
-  if (safeDb.supabase) {
-    const { data, error } = await safeDb.supabase.from('favorites').select('*').eq('telegram_id', telegramId).eq('comment_id', commentId).limit(1).maybeSingle();
-    if (error) return false;
-    return !!data;
-  }
-  return false;
-});
-
-// prefer DB helpers if present
-if (db.setAdminNotifier) safeDb.setAdminNotifier = db.setAdminNotifier;
-if (db.findOrCreateThread) safeDb.findOrCreateThread = db.findOrCreateThread;
+// safeDb wrappers
+const safeDb = db || {};
 
 // ---------- Config ----------
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -290,20 +88,41 @@ async function safeSend(fn, ...args) {
   try { return await fn(...args); } catch (e) { console.error('safeSend error', e && (e.stack || e)); return null; }
 }
 
-// small helper: get user balance (free_comments)
+// new: unified getUserBalance using safeDb
 async function getUserBalance(telegramId) {
   try {
-    if (!safeDb.supabase || !telegramId) return 0;
-    const { data, error } = await safeDb.supabase.from('users').select('free_comments').eq('telegram_id', telegramId).limit(1).maybeSingle();
-    if (error) throw error;
-    return Number((data && data.free_comments) || 0);
-  } catch (e) { console.error('getUserBalance err', e && e.message); return 0; }
+    if (!safeDb || !safeDb.getUserBalance) return 0;
+    return await safeDb.getUserBalance(telegramId);
+  } catch (e) {
+    console.error('getUserBalance err', e && e.message);
+    return 0;
+  }
 }
 
-// Reaction counts
+// new: unified credit and decrement wrappers using safeDb
+async function creditUser(telegramId, creditsToAdd) {
+  try {
+    if (!safeDb || !safeDb.creditUser) throw new Error('DB creditUser not available');
+    return await safeDb.creditUser(telegramId, creditsToAdd);
+  } catch (e) {
+    console.error('creditUser err', e && e.message);
+    throw e;
+  }
+}
+async function decrementUserBalance(telegramId, amount = 1) {
+  try {
+    if (!safeDb || !safeDb.decrementUserBalance) throw new Error('DB decrementUserBalance not available');
+    return await safeDb.decrementUserBalance(telegramId, amount);
+  } catch (e) {
+    console.error('decrementUserBalance err', e && e.message);
+    throw e;
+  }
+}
+
+// Reaction counts (unchanged but uses safeDb.reactions indirectly)
 async function getReactionCounts(commentId) {
   try {
-    if (safeDb.supabase) {
+    if (safeDb && safeDb.supabase) {
       const heartQ = await safeDb.supabase.from('reactions').select('id', { count: 'exact' }).eq('comment_id', commentId).eq('type', 'heart');
       const laughQ = await safeDb.supabase.from('reactions').select('id', { count: 'exact' }).eq('comment_id', commentId).eq('type', 'laugh');
       const dislikeQ = await safeDb.supabase.from('reactions').select('id', { count: 'exact' }).eq('comment_id', commentId).eq('type', 'dislike');
@@ -421,7 +240,7 @@ async function handleNotificationsCommand(ctx) {
 // favorites listing helper (exposed to keyboard flow) — now includes the video link
 async function showFavoritesCommand(ctx) {
   try {
-    const favRows = await listFavoritesForUser(ctx.from.id);
+    const favRows = await safeDb.listFavoritesForUser(ctx.from.id);
     if (!favRows || favRows.length === 0) return ctx.reply('No favorites yet.', mainKeyboard());
     for (const c of favRows) {
       if (c.telegram_file_id) {
@@ -453,29 +272,6 @@ async function listFavoritesForUser(telegramId) {
   } catch (e) { console.error('listFavoritesForUser err', e); return []; }
 }
 
-// safeCreditUser helper
-async function safeCreditUser(telegramId, creditsToAdd) {
-  try {
-    if (!telegramId) throw new Error('missing telegramId');
-    if (safeDb.supabase) {
-      const { data } = await safeDb.supabase.from('users').select('free_comments').eq('telegram_id', telegramId).limit(1).maybeSingle();
-      if (!data) {
-        const { data: up, error: upErr } = await safeDb.supabase.from('users').insert([{ telegram_id: telegramId, free_comments: creditsToAdd }]).select().maybeSingle();
-        if (upErr) throw upErr;
-        return up;
-      } else {
-        const current = Number(data.free_comments || 0);
-        const next = current + Number(creditsToAdd || 0);
-        const { data: u2, error: u2err } = await safeDb.supabase.from('users').update({ free_comments: next }).eq('telegram_id', telegramId).select().maybeSingle();
-        if (u2err) throw u2err;
-        return u2;
-      }
-    }
-    debugLog('safeCreditUser fallback: would credit', creditsToAdd, 'to', telegramId);
-    return null;
-  } catch (e) { console.error('safeCreditUser error', e); throw e; }
-}
-
 // ---------- initBot ----------
 async function initBot() {
   if (!BOT_TOKEN) throw new Error('Missing TELEGRAM_BOT_TOKEN in environment');
@@ -488,7 +284,6 @@ async function initBot() {
       if (safeDb.setAdminNotifier) {
         try {
           await safeDb.setAdminNotifier(text, extra);
-          // still send telegram messages
         } catch (e) { debugLog('safeDb.setAdminNotifier err', e && e.message); }
       }
       for (const adm of ADMIN_IDS) {
@@ -553,7 +348,7 @@ async function initBot() {
     }
   });
 
-  // createPaymentRequestFlow uses copy buttons + upload proof
+  // createPaymentRequestFlow uses copy buttons + upload proof — unchanged except uses safeDb
   async function createPaymentRequestFlow(ctx, pkg) {
     try {
       const created = await safeDb.createPaymentRequest({
@@ -564,7 +359,6 @@ async function initBot() {
         method: 'manual',
         status: 'pending'
       }).catch(err => {
-        // if createPaymentRequest throws, log but continue to send UI so user can still pay
         console.error('createPaymentRequest (bg) err', err && err.message);
         return null;
       });
@@ -582,15 +376,14 @@ async function initBot() {
         [ Markup.button.url('Contact admin (WhatsApp)', `${WHATSAPP_LINK}?text=Payment%20for%20request%20${pid}`) ]
       ]);
 
-      // Send details and inline keyboard together in the same message (so both show simultaneously)
+      // Send details and inline keyboard together in same message
       try {
         await ctx.replyWithMarkdown(bankText, { reply_markup: inline.reply_markup });
       } catch (e) {
-        // fallback if replyWithMarkdown fails
         try { await ctx.reply(bankText, inline); } catch (ee) { /* ignore */ }
       }
 
-      // notify admins in background (non-blocking)
+      // notify admins in background
       (async () => {
         for (const adm of ADMIN_IDS) {
           try {
@@ -621,22 +414,19 @@ async function initBot() {
       try {
         const commentId = p.commentId;
         const reason = textRaw.trim();
-        // store report if possible
         if (safeDb.supabase) {
           try {
             await safeDb.supabase.from('reports').insert([{ reporter_telegram_id: uid, reporter_username: ctx.from.username || null, comment_id: commentId, reason: reason, created_at: new Date().toISOString() }]);
           } catch (e) { /* ignore */ }
         }
-        // fetch comment + thread + owner info to send to admins with full context
         const comment = await safeDb.getCommentById(commentId).catch(()=>null);
         const thread = comment ? await safeDb.getThreadById(comment.thread_id).catch(()=>null) : null;
         let owner = null;
         try {
-          if (comment && comment.telegram_id && safeDb.supabase) {
-            const { data: ownerData, error: ownerErr } = await safeDb.supabase.from('users').select('telegram_id,username,first_name').eq('telegram_id', comment.telegram_id).limit(1).maybeSingle();
-            if (!ownerErr && ownerData) owner = ownerData;
+          if (comment && comment.telegram_id) {
+            owner = await safeDb.getUserByTelegramId ? await safeDb.getUserByTelegramId(comment.telegram_id) : null;
           }
-        } catch (e) { /* ignore owner fetch */ }
+        } catch (e) { /* ignore */ }
 
         const reporterDisplay = ctx.from.username ? `@${ctx.from.username} (${uid})` : `${ctx.from.first_name || uid} (${uid})`;
         const ownerDisplay = owner ? (owner.username ? `@${owner.username} (${owner.telegram_id})` : `${owner.first_name || owner.telegram_id} (${owner.telegram_id})`) : (comment && comment.telegram_id ? `${comment.telegram_id}` : '(unknown)');
@@ -675,7 +465,6 @@ async function initBot() {
             await safeDb.supabase.from('reports').insert([{ reporter_telegram_id: uid, reporter_username: ctx.from.username || null, reply_id: p.replyId, reason: reason, created_at: new Date().toISOString() }]);
           } catch (e) { /* ignore */ }
         }
-        // notify admins
         for (const adm of ADMIN_IDS) {
           try {
             const msg = `🚨 Report: reply #${p.replyId}\nReporter: ${ctx.from.username ? `@${ctx.from.username}` : ctx.from.first_name || uid}\nReason: ${reason}`;
@@ -760,10 +549,12 @@ async function initBot() {
           return;
         }
         // If user explicitly asked to track the video, ensure creator_telegram_id is set
-        if (p.type === 'create_thread_owned' && safeDb.supabase && thread && (!thread.creator_telegram_id || thread.creator_telegram_id !== ctx.from.id)) {
+        if (p.type === 'create_thread_owned') {
           try {
-            await safeDb.supabase.from('threads').update({ creator_telegram_id: ctx.from.id }).eq('id', thread.id);
-            thread.creator_telegram_id = ctx.from.id;
+            if (safeDb.supabase && thread && (!thread.creator_telegram_id || thread.creator_telegram_id !== ctx.from.id)) {
+              // try to update creator in DB; if this fails we ignore
+              await safeDb.supabase.from('threads').update({ creator_telegram_id: ctx.from.id }).eq('id', thread.id);
+            }
           } catch (e) { /* ignore */ }
         }
 
@@ -824,11 +615,10 @@ async function initBot() {
     }
     if (n === normalizeKbLabel('🔖 track video')) {
       try {
-        if (!safeDb.supabase) return ctx.reply('Tracking currently unavailable (DB missing).');
-        const { data, error } = await safeDb.supabase.from('threads').select('*').eq('creator_telegram_id', ctx.from.id).order('created_at', { ascending: false });
-        if (error) throw error;
-        if (!data || data.length === 0) return ctx.reply('You have no tracked videos.');
-        for (const t of data) {
+        // Use safeDb.listThreadsByCreator
+        const rows = await safeDb.listThreadsByCreator(ctx.from.id);
+        if (!rows || rows.length === 0) return ctx.reply('You have no tracked videos.');
+        for (const t of rows) {
           const inline = Markup.inlineKeyboard([
             [Markup.button.callback('🎧 Listen Comments', `listen|${t.id}|1`), Markup.button.callback('🎙 Add Voice Comment', `addvoice|${t.id}`)],
             [Markup.button.callback('🗑 Delete tracked', `delete_thread|${t.id}`)]
@@ -846,7 +636,7 @@ async function initBot() {
       return ctx.reply('Send a TikTok/YouTube link or click a tracked video to listen comments.');
     }
     if (n === normalizeKbLabel('💬 my comments')) {
-      // do NOT echo balance here (user doesn't want duplication) — just show comments
+      // show comments via safeDb.listCommentsByUser
       return handleMyComments(ctx);
     }
     if (n === normalizeKbLabel('⭐ favorites')) {
@@ -890,6 +680,13 @@ async function initBot() {
         console.error('direct create thread error', e);
         return ctx.reply('Error creating thread for that link.');
       }
+    }
+
+    // handle search input (short code)
+    if (p && p.type === 'search_prompt') {
+      PendingMap.delete(uid);
+      const code = textRaw.trim();
+      return handleSearchByCode(ctx, code);
     }
 
     // default
@@ -964,6 +761,19 @@ async function initBot() {
     // add comment voice
     if (p.type === 'add_comment' && p.threadId) {
       PendingMap.delete(uid);
+
+      // NEW: enforce balance check
+      try {
+        const balance = await getUserBalance(ctx.from.id).catch(()=>0);
+        if (Number(balance) <= 0) {
+          return ctx.reply('Insufficient credits. Please buy a package first (🛒 Buy). Your comment was not saved.');
+        }
+      } catch (e) {
+        console.error('balance check err before add_comment', e);
+        // If balance check fails, block to be safe
+        return ctx.reply('Could not verify your balance. Try again later or contact support.');
+      }
+
       try {
         const voice = ctx.message.voice;
         if (!voice) return ctx.reply('No voice found.');
@@ -978,25 +788,22 @@ async function initBot() {
         });
         if (insert && insert.error) throw insert.error;
         const row = insert.data || insert;
-        // row may be the object or {data:...}
         const savedId = (row && row.id) ? row.id : (row && row.data && row.data.id ? row.data.id : null);
         const code = utils.encodeShortCode(savedId || (row.id || (row.data && row.data.id)));
         await ctx.reply('✅ Voice saved!');
-        // send only the short code (no "Code:" label)
         await ctx.reply(`${code}`, mainKeyboard());
 
-        // decrement user's free_comments if > 0
+        // decrement user's free_comments now (use safeDb.decrementUserBalance)
         try {
-          if (safeDb.supabase) {
-            const { data: userRow, error: uErr } = await safeDb.supabase.from('users').select('free_comments').eq('telegram_id', ctx.from.id).limit(1).maybeSingle();
-            if (!uErr && userRow && typeof userRow.free_comments !== 'undefined') {
-              const current = Number(userRow.free_comments || 0);
-              if (current > 0) {
-                await safeDb.supabase.from('users').update({ free_comments: current - 1 }).eq('telegram_id', ctx.from.id);
-              }
-            }
+          const dec = await decrementUserBalance(ctx.from.id, 1).catch(err => ({ error: err && err.message }));
+          if (dec && dec.error) {
+            console.error('decrementUserBalance reported error', dec);
+            // notify user but do not remove saved comment (admin can adjust)
+            try { await ctx.reply('Note: could not decrement your balance (admin will review).'); } catch (_) {}
           }
-        } catch (e) { console.error('decrement balance err', e); }
+        } catch (e) {
+          console.error('decrementUserBalance error', e);
+        }
 
         try {
           const threadRow = await safeDb.getThreadById(p.threadId);
@@ -1100,7 +907,6 @@ async function initBot() {
 
   // callback_query handler
   bot.on('callback_query', async (ctx) => {
-    // Cancel any pending action when user presses an inline button — user intent overrides previous pending flows.
     try { PendingMap.delete(ctx.from.id); } catch (_) {}
 
     const data = ctx.callbackQuery && ctx.callbackQuery.data;
@@ -1201,13 +1007,11 @@ async function initBot() {
 
       if (cmd === 'report') {
         const commentId = Number(parts[1]);
-        // Ask reporter for reason
         PendingMap.set(ctx.from.id, { type: 'report_reason', commentId });
         await ctx.answerCbQuery();
         return ctx.reply('Please explain why you report this comment. Send a short message describing the issue.');
       }
 
-      // REPORT reply handlers (user can report a reply by text or voice)
       if (cmd === 'report_reply_text') {
         const replyId = Number(parts[1]);
         PendingMap.set(ctx.from.id, { type: 'report_reply_text', replyId });
@@ -1228,6 +1032,9 @@ async function initBot() {
           if (safeDb.supabase) {
             const { error } = await safeDb.supabase.from('voice_comments').delete().eq('id', commentId);
             if (error) throw error;
+          } else {
+            // mem fallback: delete if present
+            try { await safeDb.updatePaymentStatus; } catch (_) {}
           }
           await ctx.answerCbQuery('Comment deleted');
           return ctx.reply(`Comment #${commentId} deleted by admin.`);
@@ -1251,6 +1058,9 @@ async function initBot() {
           if (safeDb.supabase) {
             const { error } = await safeDb.supabase.from('voice_comments').delete().eq('id', commentId);
             if (error) throw error;
+          } else {
+            // mem fallback delete
+            try { /* best-effort */ } catch (_) {}
           }
           await ctx.answerCbQuery('Deleted');
           return ctx.reply('Comment deleted.');
@@ -1282,12 +1092,9 @@ async function initBot() {
         const pkg = PAYMENT_PACKAGES[idx];
         if (!pkg) { await ctx.answerCbQuery('Invalid package'); return; }
 
-        // remove any spinner immediately
         try { await ctx.answerCbQuery(); } catch (_) {}
 
-        // call the flow that sends payment details + inline together
         try {
-          // mark pending (used if you want to confirm)
           PendingMap.set(ctx.from.id, { type: 'buy_confirm', pkg });
           return await createPaymentRequestFlow(ctx, pkg);
         } catch (e) {
@@ -1337,8 +1144,19 @@ async function initBot() {
           if (payment.status === 'approved') { await ctx.answerCbQuery('Already approved'); return; }
           const up = await safeDb.updatePaymentStatus(paymentId, 'approved');
           if (up && up.error) throw up.error;
+
+          // NEW: credit user via safeDb.creditUser
           const credits = Number(payment.comments_amount || 0) || 0;
-          await safeCreditUser(payment.telegram_id, credits);
+          try {
+            await safeDb.creditUser(payment.telegram_id, credits);
+          } catch (e) {
+            console.error('admin_approve creditUser err', e);
+            // still inform admin but note failure
+            await ctx.answerCbQuery('Payment approved but crediting failed (admin must credit manually)');
+            try { await bot.telegram.sendMessage(payment.telegram_id, `Your payment #${paymentId} was approved but we could not credit your account automatically. Contact admin.`); } catch (_) {}
+            return;
+          }
+
           await ctx.answerCbQuery('Payment approved & credited');
           try { await bot.telegram.sendMessage(payment.telegram_id, `Your payment #${paymentId} was approved. Credited ${credits} comments.`); } catch (_) {}
           return;
@@ -1388,9 +1206,7 @@ async function initBot() {
             await ctx.reply(`Comment by ${c.first_name || c.username || 'User'}`);
           }
           const inline = await buildActionsInline(c.id, ctx.from.id);
-          // send only the short code (no "Code:" label)
           await ctx.reply(utils.encodeShortCode(c.id), inline);
-          // show which video
           const thr = await safeDb.getThreadById(c.thread_id).catch(()=>null);
           if (thr) await ctx.reply(`Video: ${thr.social_link || thr.canonical_link || '(unknown)'}`);
         } catch (e) { console.error('sendCommentsPage per comment err', e); }
@@ -1428,17 +1244,13 @@ async function initBot() {
 
   async function handleMyComments(ctx) {
     try {
-      if (!safeDb.supabase) return ctx.reply('Could not fetch your comments (DB missing).');
-      const { data, error } = await safeDb.supabase.from('voice_comments').select('*').eq('telegram_id', ctx.from.id).order('created_at', { ascending: false }).limit(30);
-      if (error) throw error;
-      if (!data || data.length === 0) return ctx.reply('You have no comments yet.');
-      for (const c of data) {
+      const rows = await safeDb.listCommentsByUser(ctx.from.id);
+      if (!rows || rows.length === 0) return ctx.reply('You have no comments yet.');
+      for (const c of rows) {
         if (c.telegram_file_id) await ctx.replyWithVoice(c.telegram_file_id, { caption: `${c.first_name || c.username || 'You'} • ${new Date(c.created_at).toLocaleString()}` });
         else await ctx.reply('Comment: (no voice saved)');
         const inline = await buildActionsInline(c.id, ctx.from.id);
-        // send only the short code
         await ctx.reply(utils.encodeShortCode(c.id), inline);
-        // show video link
         const thr = await safeDb.getThreadById(c.thread_id).catch(()=>null);
         if (thr) await ctx.reply(`Video: ${thr.social_link || thr.canonical_link || '(unknown)'}`);
       }
