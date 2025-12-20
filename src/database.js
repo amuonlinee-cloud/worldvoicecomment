@@ -1,7 +1,6 @@
 // src/database.js
-// Supabase wrapper with an in-memory fallback when network/supabase calls fail.
-// If SUPABASE_URL & SUPABASE_KEY present, we try supabase but any network/fetch failure
-// causes an automatic switch to the in-memory fallback for the remainder of the process.
+// Supabase wrapper with an in-memory fallback when env is missing.
+// Adds user balance helpers and listing helpers so bot.js doesn't touch supabase directly.
 
 const utils = require('./utils');
 
@@ -47,16 +46,62 @@ function _normalizeLinkForKey(l) {
   try { return String(l).trim().replace(/[)\]\.]+$/g, '').toLowerCase().replace(/\/$/,''); } catch (e) { return String(l); }
 }
 
+// Mem-only helpers for users (free_comments)
+function _ensureMemUser(telegramId, userObj = {}) {
+  const key = String(telegramId);
+  let u = state.users.get(key);
+  if (!u) {
+    u = Object.assign({ telegram_id: telegramId, username: null, first_name: null, free_comments: 0, created_at: new Date().toISOString() }, userObj);
+    state.users.set(key, u);
+  } else {
+    // merge
+    Object.assign(u, userObj);
+    state.users.set(key, u);
+  }
+  return u;
+}
+
 // Build an in-memory API (same signatures as supabase-backed functions)
 const mem = {
   supabase: null,
 
   ensureUserRow: async (user) => {
     if (!user || !user.id) return null;
-    const key = String(user.id);
-    const obj = { telegram_id: user.id, username: user.username || null, first_name: user.first_name || null, created_at: new Date().toISOString() };
-    state.users.set(key, obj);
+    const obj = _ensureMemUser(user.id, { username: user.username || null, first_name: user.first_name || null });
     return obj;
+  },
+
+  getUserByTelegramId: async (telegramId) => {
+    if (!telegramId) return null;
+    const key = String(telegramId);
+    return state.users.get(key) || null;
+  },
+
+  getUserBalance: async (telegramId) => {
+    if (!telegramId) return 0;
+    const u = state.users.get(String(telegramId));
+    if (!u) return 0;
+    return Number(u.free_comments || 0);
+  },
+
+  creditUser: async (telegramId, amount) => {
+    if (!telegramId) return null;
+    const cur = _ensureMemUser(telegramId);
+    const next = Number(cur.free_comments || 0) + Number(amount || 0);
+    cur.free_comments = next;
+    state.users.set(String(telegramId), cur);
+    return cur;
+  },
+
+  decrementUserBalance: async (telegramId, amount) => {
+    if (!telegramId) return { error: 'missing telegram id' };
+    const cur = _ensureMemUser(telegramId);
+    const current = Number(cur.free_comments || 0);
+    const dec = Number(amount || 1);
+    if (current < dec) return { error: 'insufficient' };
+    cur.free_comments = current - dec;
+    state.users.set(String(telegramId), cur);
+    return { data: cur };
   },
 
   findOrCreateThread: async (link, creatorTelegramId = null) => {
@@ -88,6 +133,11 @@ const mem = {
 
   getThreadById: async (id) => {
     return state.threads.get(Number(id)) || null;
+  },
+
+  listThreadsByCreator: async (telegramId) => {
+    const arr = Array.from(state.threads.values()).filter(t => Number(t.creator_telegram_id) === Number(telegramId));
+    return arr.sort((a,b)=> new Date(b.created_at) - new Date(a.created_at));
   },
 
   createPaymentRequest: async (payload) => {
@@ -122,6 +172,11 @@ const mem = {
     const arr = Array.from(state.voice_comments.values()).filter(c => Number(c.thread_id) === Number(threadId)).sort((a,b)=> new Date(b.created_at) - new Date(a.created_at));
     const slice = arr.slice(offset, offset + limit);
     return { data: slice };
+  },
+
+  listCommentsByUser: async (telegramId, limit = 30) => {
+    const arr = Array.from(state.voice_comments.values()).filter(c => Number(c.telegram_id) === Number(telegramId)).sort((a,b)=> new Date(b.created_at) - new Date(a.created_at));
+    return arr.slice(0, limit);
   },
 
   getCommentById: async (id) => {
@@ -214,6 +269,75 @@ const api = {
       if (isNetworkError(err)) markFallback(err);
       console.error('[database] ensureUserRow supabase err', err && (err.message || err));
       return mem.ensureUserRow(user);
+    }
+  },
+
+  getUserByTelegramId: async (telegramId) => {
+    if (!useSupabase || !api.supabase) return mem.getUserByTelegramId(telegramId);
+    try {
+      const { data, error } = await api.supabase.from('users').select('*').eq('telegram_id', telegramId).limit(1).maybeSingle();
+      if (error) throw error;
+      return data || null;
+    } catch (err) {
+      console.error('[database] getUserByTelegramId supabase err', err && (err.message || err));
+      if (isNetworkError(err)) markFallback(err);
+      return mem.getUserByTelegramId(telegramId);
+    }
+  },
+
+  getUserBalance: async (telegramId) => {
+    if (!useSupabase || !api.supabase) return mem.getUserBalance(telegramId);
+    try {
+      const { data, error } = await api.supabase.from('users').select('free_comments').eq('telegram_id', telegramId).limit(1).maybeSingle();
+      if (error) throw error;
+      return Number((data && data.free_comments) || 0);
+    } catch (err) {
+      console.error('[database] getUserBalance supabase err', err && (err.message || err));
+      if (isNetworkError(err)) markFallback(err);
+      return mem.getUserBalance(telegramId);
+    }
+  },
+
+  creditUser: async (telegramId, amount) => {
+    if (!useSupabase || !api.supabase) return mem.creditUser(telegramId, amount);
+    try {
+      // upsert user row if missing
+      const { data: existing } = await api.supabase.from('users').select('telegram_id,free_comments').eq('telegram_id', telegramId).limit(1).maybeSingle();
+      if (!existing) {
+        const { data } = await api.supabase.from('users').insert([{ telegram_id: telegramId, free_comments: amount }]).select().maybeSingle();
+        return data;
+      } else {
+        const current = Number(existing.free_comments || 0);
+        const next = current + Number(amount || 0);
+        const { data } = await api.supabase.from('users').update({ free_comments: next }).eq('telegram_id', telegramId).select().maybeSingle();
+        return data;
+      }
+    } catch (err) {
+      console.error('[database] creditUser supabase err', err && (err.message || err));
+      if (isNetworkError(err)) markFallback(err);
+      return mem.creditUser(telegramId, amount);
+    }
+  },
+
+  decrementUserBalance: async (telegramId, amount) => {
+    if (!useSupabase || !api.supabase) return mem.decrementUserBalance(telegramId, amount);
+    try {
+      const { data } = await api.supabase.from('users').select('free_comments').eq('telegram_id', telegramId).limit(1).maybeSingle();
+      if (!data) {
+        // cannot decrement if user not present or zero
+        return { error: 'not found or zero' };
+      }
+      const current = Number(data.free_comments || 0);
+      const dec = Number(amount || 1);
+      if (current < dec) return { error: 'insufficient' };
+      const next = current - dec;
+      const { data: upd, error: uerr } = await api.supabase.from('users').update({ free_comments: next }).eq('telegram_id', telegramId).select().maybeSingle();
+      if (uerr) return { error: uerr };
+      return { data: upd };
+    } catch (err) {
+      console.error('[database] decrementUserBalance supabase err', err && (err.message || err));
+      if (isNetworkError(err)) markFallback(err);
+      return mem.decrementUserBalance(telegramId, amount);
     }
   },
 
@@ -321,6 +445,19 @@ const api = {
     }
   },
 
+  listThreadsByCreator: async (telegramId) => {
+    if (!useSupabase || !api.supabase) return mem.listThreadsByCreator(telegramId);
+    try {
+      const { data, error } = await api.supabase.from('threads').select('*').eq('creator_telegram_id', telegramId).order('created_at', { ascending: false });
+      if (error) throw error;
+      return data || [];
+    } catch (err) {
+      console.error('[database] listThreadsByCreator supabase err', err && (err.message || err));
+      if (isNetworkError(err)) markFallback(err);
+      return mem.listThreadsByCreator(telegramId);
+    }
+  },
+
   createPaymentRequest: async (payload) => {
     if (!useSupabase || !api.supabase) return mem.createPaymentRequest(payload);
     try {
@@ -385,6 +522,19 @@ const api = {
       console.error('[database] listCommentsByThread supabase err', err && (err.message || err));
       if (isNetworkError(err)) markFallback(err);
       return mem.listCommentsByThread(threadId, offset, limit);
+    }
+  },
+
+  listCommentsByUser: async (telegramId, limit = 30) => {
+    if (!useSupabase || !api.supabase) return mem.listCommentsByUser(telegramId, limit);
+    try {
+      const { data, error } = await api.supabase.from('voice_comments').select('*').eq('telegram_id', telegramId).order('created_at', { ascending: false }).limit(limit);
+      if (error) return [];
+      return data || [];
+    } catch (err) {
+      console.error('[database] listCommentsByUser supabase err', err && (err.message || err));
+      if (isNetworkError(err)) markFallback(err);
+      return mem.listCommentsByUser(telegramId, limit);
     }
   },
 
