@@ -29,18 +29,20 @@ module.exports = async (req, res) => {
     if (!botPromise) botPromise = initBot(); // returns a Telegraf instance (your code)
     const bot = await botPromise;
 
-    // IMPORTANT: do NOT pass `res` into handleUpdate here. Passing the Node response object
-    // allows Telegraf to write to the response and may cause double responses (ERR_HTTP_HEADERS_SENT).
-    // Instead, call handleUpdate(update) and send our own HTTP 200 once.
+    // Pass the update to telegraf to handle it (serverless-friendly)
+    // DO NOT pass `res` into handleUpdate — let us control the HTTP response here.
     await bot.handleUpdate(req.body);
 
-    // Respond once to Telegram
-    if (!res.headersSent) return res.status(200).send('OK');
+    // send 200 to Telegram
+    if (!res.headersSent) res.status(200).send('OK');
   } catch (err) {
     console.error('telegram webhook handler error', err);
-    // During debugging return 500; in production you may prefer 200 to avoid repeated deliveries.
-    try {
-      if (!res.headersSent) return res.status(500).send('Server error');
-    } catch (e) { /* ignore */ }
+    if (!res.headersSent) {
+      // respond 500 so Telegram may retry; change to 200 if you prefer no retries.
+      res.status(500).send('Server error');
+    } else {
+      // headers already sent (rare) — just end
+      try { res.end(); } catch (_) {}
+    }
   }
 };
