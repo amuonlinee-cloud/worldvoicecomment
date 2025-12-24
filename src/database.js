@@ -1,14 +1,6 @@
 // src/database.js
-// Supabase wrapper with in-memory fallback, exposes helpers used by the bot.
-// - Provides: ensureUserRow, getUserBalance, creditUser, decrementUserBalance,
-//   findOrCreateThread, getThreadByLink, getThreadById, setThreadCreator,
-//   listThreadsByCreator, createPaymentRequest, getPaymentById, updatePaymentStatus,
-//   insertVoiceComment, listCommentsByThread, listCommentsByUser, getCommentById,
-//   insertReplyRow, listReplies, getReplyById, toggleFavoriteRow, isFavorite,
-//   toggleReaction, getReactionCounts, listFavoritesForUser, addNotificationRow,
-//   listNotifications, setAdminNotifier, insertReport, listReports, getReportById,
-//   deleteReport, deleteCommentById, deleteReplyById, deleteThreadById,
-//   isUsingSupabase, _mem_state (for debugging)
+// Supabase wrapper with in-memory fallback for reliability.
+// Exports many helper functions used by bot.js
 
 const utils = require('./utils');
 
@@ -20,20 +12,17 @@ let usingSupabase = Boolean(SUPABASE_URL && SUPABASE_KEY && !DISABLE_SUPABASE);
 let supabase = null;
 
 function markFallback(reason) {
-  if (usingSupabase) {
-    console.error('[database] Supabase failing: switching to in-memory fallback. Reason:', reason && (reason.message || reason));
-  }
+  if (usingSupabase) console.error('[database] Supabase failing: switching to in-memory fallback. Reason:', reason && (reason.message || reason));
   usingSupabase = false;
   supabase = null;
 }
-
 function isNetworkError(err) {
   if (!err) return false;
   const m = String(err && (err.message || err)).toLowerCase();
   return m.includes('fetch failed') || m.includes('network') || m.includes('undici') || m.includes('timeout');
 }
 
-// In-memory fallback structures. Keeps data only while process alive.
+// In-memory fallback
 const mem = {
   users: new Map(),
   threads: new Map(),
@@ -47,7 +36,6 @@ const mem = {
   reports: new Map(),
   counters: { thread: 1000, comment: 10000, reply: 50000, payment: 90000, reaction: 400000, report: 800000 }
 };
-
 function memNext(kind) {
   const c = mem.counters;
   if (kind === 'thread') return ++c.thread;
@@ -64,7 +52,7 @@ function memNormalizeKey(l) {
   return String(l).trim().replace(/[)\]\.]+$/g, '').toLowerCase().replace(/\/$/,'');
 }
 
-// --- In-memory helpers
+// mem helpers (keeps state in-memory)
 const memHelpers = {
   ensureUserRow: async (user) => {
     if (!user || !user.id) return null;
@@ -74,24 +62,17 @@ const memHelpers = {
     return mem.users.get(key);
   },
 
-  getUserByTelegramId: async (telegramId) => {
-    const u = mem.users.get(String(telegramId));
-    return u || null;
-  },
+  getUserByTelegramId: async (telegramId) => mem.users.get(String(telegramId)) || null,
 
   getUserBalance: async (telegramId) => {
-    const u = mem.users.get(String(telegramId));
-    return u ? Number(u.free_comments || 0) : 0;
+    const u = mem.users.get(String(telegramId)); return u ? Number(u.free_comments || 0) : 0;
   },
 
   creditUser: async (telegramId, amount) => {
     const key = String(telegramId);
     let u = mem.users.get(key);
-    if (!u) {
-      u = { telegram_id: telegramId, username: null, first_name: null, free_comments: Number(amount || 0), created_at: new Date().toISOString() };
-    } else {
-      u.free_comments = Number(u.free_comments || 0) + Number(amount || 0);
-    }
+    if (!u) u = { telegram_id: telegramId, username: null, first_name: null, free_comments: Number(amount || 0), created_at: new Date().toISOString() };
+    else u.free_comments = Number(u.free_comments || 0) + Number(amount || 0);
     mem.users.set(key, u);
     return u;
   },
@@ -115,10 +96,7 @@ const memHelpers = {
     if (mem.threadsByCanonical.has(canonical)) {
       const id = mem.threadsByCanonical.get(canonical);
       const t = mem.threads.get(id);
-      if (creatorTelegramId && (!t.creator_telegram_id || t.creator_telegram_id !== creatorTelegramId)) {
-        t.creator_telegram_id = creatorTelegramId;
-        mem.threads.set(id, t);
-      }
+      if (creatorTelegramId && (!t.creator_telegram_id || t.creator_telegram_id !== creatorTelegramId)) { t.creator_telegram_id = creatorTelegramId; mem.threads.set(id,t); }
       return t;
     }
     const id = memNext('thread');
@@ -145,41 +123,27 @@ const memHelpers = {
     return id ? mem.threads.get(id) : null;
   },
 
-  getThreadById: async (id) => {
-    return mem.threads.get(Number(id)) || null;
-  },
+  getThreadById: async (id) => mem.threads.get(Number(id)) || null,
 
   setThreadCreator: async (threadId, telegramId) => {
     const t = mem.threads.get(Number(threadId));
     if (!t) return null;
-    t.creator_telegram_id = telegramId;
-    mem.threads.set(Number(threadId), t);
-    return t;
+    t.creator_telegram_id = telegramId; mem.threads.set(Number(threadId), t); return t;
   },
 
-  listThreadsByCreator: async (telegramId) => {
-    const arr = Array.from(mem.threads.values()).filter(t => Number(t.creator_telegram_id) === Number(telegramId));
-    return arr.sort((a,b) => new Date(b.created_at) - new Date(a.created_at));
-  },
+  listThreadsByCreator: async (telegramId) => Array.from(mem.threads.values()).filter(t => Number(t.creator_telegram_id) === Number(telegramId)),
 
   createPaymentRequest: async (payload) => {
     const id = memNext('payment');
     const row = Object.assign({ id, status: 'pending', created_at: new Date().toISOString() }, payload);
-    mem.payment_requests.set(Number(id), row);
-    return row;
+    mem.payment_requests.set(Number(id), row); return row;
   },
 
-  getPaymentById: async (id) => {
-    return mem.payment_requests.get(Number(id)) || null;
-  },
+  getPaymentById: async (id) => mem.payment_requests.get(Number(id)) || null,
 
   updatePaymentStatus: async (id, status, updates = {}) => {
-    const pid = Number(id);
-    const existing = mem.payment_requests.get(pid);
-    if (!existing) return { error: 'not found' };
-    const updated = Object.assign({}, existing, updates, { status });
-    mem.payment_requests.set(pid, updated);
-    return { data: updated };
+    const pid = Number(id); const existing = mem.payment_requests.get(pid); if (!existing) return { error: 'not found' };
+    const updated = Object.assign({}, existing, updates, { status }); mem.payment_requests.set(pid, updated); return { data: updated };
   },
 
   insertVoiceComment: async (payload) => {
@@ -190,73 +154,39 @@ const memHelpers = {
   },
 
   listCommentsByThread: async (threadId, offset = 0, limit = 15) => {
-    if (!threadId) return { data: [] };
     const arr = Array.from(mem.voice_comments.values()).filter(c => Number(c.thread_id) === Number(threadId)).sort((a,b) => new Date(b.created_at) - new Date(a.created_at));
-    const slice = arr.slice(offset, offset + limit);
-    return { data: slice };
+    const slice = arr.slice(offset, offset + limit); return { data: slice };
   },
 
-  listCommentsByUser: async (telegramId, limit = 30) => {
-    const arr = Array.from(mem.voice_comments.values()).filter(c => Number(c.telegram_id) === Number(telegramId)).sort((a,b)=> new Date(b.created_at) - new Date(a.created_at));
-    return arr.slice(0, limit);
-  },
+  listCommentsByUser: async (telegramId, limit = 30) => Array.from(mem.voice_comments.values()).filter(c => Number(c.telegram_id) === Number(telegramId)).sort((a,b)=> new Date(b.created_at) - new Date(a.created_at)).slice(0, limit),
 
-  getCommentById: async (id) => {
-    return mem.voice_comments.get(Number(id)) || null;
-  },
+  getCommentById: async (id) => mem.voice_comments.get(Number(id)) || null,
 
   insertReplyRow: async (payload) => {
-    const id = memNext('reply');
-    const row = Object.assign({}, payload, { id, created_at: new Date().toISOString() });
-    mem.replies.set(id, row);
-    return row;
+    const id = memNext('reply'); const row = Object.assign({}, payload, { id, created_at: new Date().toISOString() }); mem.replies.set(id, row); return row;
   },
 
-  listReplies: async (commentId) => {
-    return Array.from(mem.replies.values()).filter(r => Number(r.comment_id) === Number(commentId)).sort((a,b)=> new Date(a.created_at) - new Date(b.created_at));
-  },
-
-  getReplyById: async (id) => {
-    return mem.replies.get(Number(id)) || null;
-  },
+  listReplies: async (commentId) => Array.from(mem.replies.values()).filter(r => Number(r.comment_id) === Number(commentId)).sort((a,b)=> new Date(a.created_at) - new Date(b.created_at)),
 
   toggleFavoriteRow: async (telegramId, commentId) => {
-    const key = `${telegramId}:${commentId}`;
-    if (mem.favorites.has(key)) { mem.favorites.delete(key); return { removed: true }; }
-    mem.favorites.set(key, { telegram_id: telegramId, comment_id: commentId, created_at: new Date().toISOString() });
-    return { removed: false, data: { telegram_id: telegramId, comment_id: commentId } };
+    const key = `${telegramId}:${commentId}`; if (mem.favorites.has(key)) { mem.favorites.delete(key); return { removed: true }; } mem.favorites.set(key, { telegram_id: telegramId, comment_id: commentId, created_at: new Date().toISOString() }); return { removed: false, data: { telegram_id, comment_id } };
   },
 
-  isFavorite: async (telegramId, commentId) => {
-    return mem.favorites.has(`${telegramId}:${commentId}`);
-  },
+  isFavorite: async (telegramId, commentId) => !!mem.favorites.has(`${telegramId}:${commentId}`),
 
   toggleReaction: async (telegramId, commentId, type) => {
     const list = Array.from(mem.reactions.values()).filter(r => Number(r.comment_id) === Number(commentId) && String(r.telegram_id) === String(telegramId));
     if (list.length > 0) {
       const existing = list[0];
-      if (existing.type === type) {
-        mem.reactions.delete(existing.id);
-        return { removed: true, type };
-      } else {
-        existing.type = type;
-        existing.created_at = new Date().toISOString();
-        mem.reactions.set(existing.id, existing);
-        return { updated: true, type };
-      }
+      if (existing.type === type) { mem.reactions.delete(existing.id); return { removed: true, type }; } else { existing.type = type; existing.created_at = new Date().toISOString(); mem.reactions.set(existing.id, existing); return { updated: true, type }; }
     } else {
-      const id = memNext('reaction');
-      const r = { id, comment_id: commentId, telegram_id: telegramId, type, created_at: new Date().toISOString() };
-      mem.reactions.set(id, r);
-      return { added: true, type };
+      const id = memNext('reaction'); const r = { id, comment_id: commentId, telegram_id: telegramId, type, created_at: new Date().toISOString() }; mem.reactions.set(id, r); return { added: true, type };
     }
   },
 
   getReactionCounts: async (commentId) => {
     const arr = Array.from(mem.reactions.values()).filter(r => Number(r.comment_id) === Number(commentId));
-    const counts = { heart: 0, laugh: 0, dislike: 0 };
-    for (const r of arr) counts[r.type] = (counts[r.type] || 0) + 1;
-    return counts;
+    const counts = { heart:0, laugh:0, dislike:0 }; for (const r of arr) counts[r.type] = (counts[r.type] || 0) + 1; return counts;
   },
 
   listFavoritesForUser: async (telegramId) => {
@@ -266,81 +196,49 @@ const memHelpers = {
   },
 
   addNotificationRow: async (payload) => {
-    const id = Date.now();
-    const row = Object.assign({}, payload, { id, created_at: new Date().toISOString() });
-    mem.notifications.set(id, row);
-    return { data: row };
+    const id = Date.now(); const row = Object.assign({}, payload, { id, created_at: new Date().toISOString() }); mem.notifications.set(id, row); return { data: row };
   },
 
   listNotifications: async (telegramId) => {
-    const items = Array.from(mem.notifications.values()).filter(n => Number(n.telegram_id) === Number(telegramId)).sort((a,b)=> new Date(b.created_at) - new Date(a.created_at));
-    return { data: items };
+    const items = Array.from(mem.notifications.values()).filter(n => Number(n.telegram_id) === Number(telegramId)).sort((a,b)=> new Date(b.created_at) - new Date(a.created_at)); return { data: items };
   },
 
-  setAdminNotifier: async (text, meta) => {
-    const id = Date.now();
-    mem.notifications.set(id, { id, telegram_id: null, message: text, meta: meta || {}, created_at: new Date().toISOString() });
-  },
+  setAdminNotifier: async (text, meta) => { const id = Date.now(); mem.notifications.set(id, { id, telegram_id: null, message: text, meta: meta || {}, created_at: new Date().toISOString() }); },
 
-  insertReport: async (payload) => {
-    const id = memNext('report');
-    const r = Object.assign({ id, status: 'open', created_at: new Date().toISOString() }, payload);
-    mem.reports.set(id, r);
-    return r;
-  },
+  insertReport: async (payload) => { const id = memNext('report'); const r = Object.assign({ id, status: 'open', created_at: new Date().toISOString() }, payload); mem.reports.set(id, r); return r; },
 
   listReports: async (filter = {}) => {
-    const arr = Array.from(mem.reports.values());
-    let out = arr;
-    if (filter.status) out = out.filter(r => r.status === filter.status);
-    if (filter.comment_id) out = out.filter(r => Number(r.comment_id) === Number(filter.comment_id));
-    if (filter.reply_id) out = out.filter(r => Number(r.reply_id) === Number(filter.reply_id));
-    return out.sort((a,b)=> new Date(b.created_at) - new Date(a.created_at));
+    const arr = Array.from(mem.reports.values()); let out = arr; if (filter.status) out = out.filter(r => r.status === filter.status); if (filter.comment_id) out = out.filter(r => Number(r.comment_id) === Number(filter.comment_id)); if (filter.reply_id) out = out.filter(r => Number(r.reply_id) === Number(filter.reply_id)); return out.sort((a,b)=> new Date(b.created_at) - new Date(a.created_at));
   },
 
-  getReportById: async (id) => {
-    return mem.reports.get(Number(id)) || null;
-  },
+  getReportById: async (id) => mem.reports.get(Number(id)) || null,
 
-  deleteReport: async (id) => {
-    return mem.reports.delete(Number(id));
-  },
+  deleteReport: async (id) => mem.reports.delete(Number(id)),
 
   deleteCommentById: async (id) => {
     const mid = Number(id);
     const removed = mem.voice_comments.delete(mid);
-    for (const [rid, r] of Array.from(mem.replies.entries())) {
-      if (Number(r.comment_id) === mid) mem.replies.delete(rid);
-    }
+    for (const [rid,r] of Array.from(mem.replies.entries())) if (Number(r.comment_id) === mid) mem.replies.delete(rid);
     return removed ? { deleted: true } : { error: 'not found' };
   },
 
-  deleteReplyById: async (id) => {
-    const mid = Number(id);
-    return mem.replies.delete(mid) ? { deleted: true } : { error: 'not found' };
-  },
+  deleteReplyById: async (id) => { const mid = Number(id); return mem.replies.delete(mid) ? { deleted: true } : { error: 'not found' }; },
 
   deleteThreadById: async (id) => {
     const tid = Number(id);
     const t = mem.threads.get(tid);
-    if (t) {
-      const key = memNormalizeKey(t.canonical_link || t.social_link || '');
-      if (mem.threadsByCanonical.has(key) && mem.threadsByCanonical.get(key) === tid) mem.threadsByCanonical.delete(key);
-      mem.threads.delete(tid);
-    }
-    for (const [cid, c] of Array.from(mem.voice_comments.entries())) {
+    if (t) { const key = memNormalizeKey(t.canonical_link || t.social_link || ''); if (mem.threadsByCanonical.has(key) && mem.threadsByCanonical.get(key) === tid) mem.threadsByCanonical.delete(key); mem.threads.delete(tid); }
+    for (const [cid,c] of Array.from(mem.voice_comments.entries())) {
       if (Number(c.thread_id) === tid) {
         mem.voice_comments.delete(cid);
-        for (const [rid, r] of Array.from(mem.replies.entries())) {
-          if (Number(r.comment_id) === Number(cid)) mem.replies.delete(rid);
-        }
+        for (const [rid,r] of Array.from(mem.replies.entries())) { if (Number(r.comment_id) === Number(cid)) mem.replies.delete(rid); }
       }
     }
     return true;
   }
 };
 
-// Try to create supabase client if env present
+// Try creating supabase client if env present
 if (usingSupabase) {
   try {
     const { createClient } = require('@supabase/supabase-js');
@@ -351,7 +249,7 @@ if (usingSupabase) {
   }
 }
 
-// Main API that prefers Supabase and falls back to memory with logging
+// API that prefers Supabase and falls back to mem
 const api = {
   supabase,
   mode: usingSupabase ? 'supabase' : 'memory',
@@ -474,7 +372,6 @@ const api = {
         } catch (e) {}
       }
 
-      // try social_link candidate search
       for (const cand of uniq) {
         try {
           const { data } = await api.supabase.from('threads').select('*').ilike('social_link', cand).limit(1).maybeSingle();
@@ -488,7 +385,6 @@ const api = {
         } catch (e) {}
       }
 
-      // create
       const insertRow = {
         social_link: link,
         canonical_link: (normalized && normalized.canonicalLink) ? normalized.canonicalLink : null,
@@ -698,18 +594,6 @@ const api = {
       console.error('[database] listReplies supabase err', err && (err.message || err));
       if (isNetworkError(err)) markFallback(err);
       return memHelpers.listReplies(commentId);
-    }
-  },
-
-  getReplyById: async (id) {
-    if (!usingSupabase || !api.supabase) return memHelpers.getReplyById(id);
-    try {
-      const { data } = await api.supabase.from('replies').select('*').eq('id', id).limit(1).maybeSingle();
-      return data || null;
-    } catch (err) {
-      console.error('[database] getReplyById supabase err', err && (err.message || err));
-      if (isNetworkError(err)) markFallback(err);
-      return memHelpers.getReplyById(id);
     }
   },
 
