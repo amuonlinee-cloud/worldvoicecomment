@@ -1,35 +1,23 @@
 // src/utils.js
-// Utility helpers: link normalization (YouTube & TikTok), short code encoding/decoding,
-// URL extraction, input normalization, and small helpers used by the bot.
+// Link normalizer + helpers (YouTube + TikTok with oEmbed thumbnail)
 
-const URL = require('url').URL;
+const fetch = global.fetch || (typeof require === 'function' ? (() => { try { return require('node-fetch'); } catch(e){ return null; } })() : null);
+const { URL } = require('url');
 
-/**
- * normalizeVideoUrl(link)
- * - Returns an object: { canonicalLink, provider, id, thumbnail }
- * - Supports YouTube (youtu.be / youtube.com) and TikTok (tiktok.com / vm.tiktok.com)
- */
 async function normalizeVideoUrl(link) {
   if (!link || typeof link !== 'string') return { canonicalLink: link, provider: null, id: null, thumbnail: null };
-
-  let urlStr = link.trim();
-  // remove surrounding punctuation
-  urlStr = urlStr.replace(/[<>]/g, '').trim();
-
+  let urlStr = link.trim().replace(/[<>]/g,'').trim();
+  if (!/^https?:\/\//i.test(urlStr)) urlStr = 'https://' + urlStr;
   try {
-    // Ensure protocol
-    if (!/^https?:\/\//i.test(urlStr)) urlStr = 'https://' + urlStr;
     const u = new URL(urlStr);
     const host = u.hostname.toLowerCase();
 
-    // YouTube
+    // YouTube (youtube.com / youtu.be / shorts)
     if (host.includes('youtube.com') || host.includes('youtu.be')) {
       let vid = null;
-      if (host.includes('youtu.be')) {
-        vid = u.pathname.slice(1);
-      } else {
+      if (host.includes('youtu.be')) vid = u.pathname.slice(1);
+      else {
         vid = u.searchParams.get('v') || null;
-        // handle /shorts/ID or /watch?v=ID
         if (!vid && u.pathname && u.pathname.includes('/shorts/')) {
           vid = u.pathname.split('/shorts/')[1].split('/')[0];
         }
@@ -39,78 +27,75 @@ async function normalizeVideoUrl(link) {
       return { canonicalLink: canonical, provider: 'youtube', id: vid, thumbnail };
     }
 
-    // TikTok
+    // TikTok: try oEmbed for thumbnail
     if (host.includes('tiktok.com') || host.includes('vm.tiktok.com')) {
-      // tiktok links may have the video id in path or redirect
-      // For canonical: use host+pathname, attempt to extract id-like tokens
       let path = u.pathname || '';
-      // TikTok video id might be last path segment
       let possibleId = path.split('/').filter(Boolean).slice(-1)[0] || null;
-      // Some tiktok URLs are like /@user/video/7123456789
       if (path.includes('/video/')) {
         const parts = path.split('/video/');
         possibleId = (parts[1] || '').split('/')[0] || possibleId;
       }
       const canonical = urlStr;
-      // Thumbnail: TikTok doesn't provide static thumb via predictable URL, leave null
+      // try oEmbed to get thumbnail
+      try {
+        const oembedUrl = `https://www.tiktok.com/oembed?url=${encodeURIComponent(urlStr)}`;
+        if (fetch) {
+          const resp = await fetch(oembedUrl, { method: 'GET' });
+          if (resp && resp.ok) {
+            const j = await resp.json();
+            if (j && j.thumbnail_url) {
+              return { canonicalLink: canonical, provider: 'tiktok', id: possibleId, thumbnail: j.thumbnail_url };
+            }
+          }
+        }
+      } catch (e) {
+        // ignore and fallback to no thumbnail
+      }
       return { canonicalLink: canonical, provider: 'tiktok', id: possibleId, thumbnail: null };
     }
 
-    // Vercel or other hosting or raw links: fallback canonicalization
+    // fallback
     return { canonicalLink: urlStr, provider: null, id: null, thumbnail: null };
   } catch (e) {
-    // fallback: return raw link as canonical
     return { canonicalLink: link, provider: null, id: null, thumbnail: null };
   }
 }
 
-// extract first URL from text
 function extractFirstUrl(text) {
   if (!text) return null;
   const m = String(text).match(/\bhttps?:\/\/[^\s)]+/i);
   if (m && m[0]) return m[0].replace(/[),.]+$/,'');
-  // also support bare tiktok/youtube without protocol like 'youtu.be/abc'
   const m2 = String(text).match(/\b(?:www\.)?(tiktok\.com|youtu\.be|youtube\.com)\/[^\s)]+/i);
   return m2 ? (m2[0].startsWith('http') ? m2[0] : 'https://' + m2[0]) : null;
 }
 
-// normalize input (trim & collapse whitespace)
 function normalizeInput(s) {
   if (!s) return '';
-  return String(s).replace(/\s+/g, ' ').trim();
+  return String(s).replace(/\s+/g,' ').trim();
 }
 
-// short-code encode/decode (human friendly)
 function encodeShortCode(id) {
   if (id === undefined || id === null) return '';
   const n = Number(id) || 0;
-  return n.toString(36).toUpperCase().padStart(6, '0');
+  return n.toString(36).toUpperCase().padStart(6,'0');
 }
 function decodeShortCode(code) {
   if (!code) return null;
   try {
-    const cleaned = String(code).replace(/[^0-9A-Za-z]/g, '').toLowerCase();
+    const cleaned = String(code).replace(/[^0-9A-Za-z]/g,'').toLowerCase();
     return parseInt(cleaned, 36);
-  } catch (e) {
-    return null;
-  }
+  } catch (e) { return null; }
 }
 
-// basic link normalizer for display (remove query tracking, trailing slashes)
 function normalizeDisplayLink(link) {
   if (!link) return link;
   try {
     let url = new URL(link);
-    // remove common tracking query params
     ['utm_source','utm_medium','utm_campaign','utm_term','utm_content','fbclid','igshid'].forEach(p => url.searchParams.delete(p));
-    // rebuild
     let out = url.toString();
-    // remove trailing slash
     out = out.replace(/\/$/, '');
     return out;
-  } catch (e) {
-    return link;
-  }
+  } catch (e) { return link; }
 }
 
 module.exports = {
@@ -120,8 +105,5 @@ module.exports = {
   encodeShortCode,
   decodeShortCode,
   normalizeDisplayLink,
-  isSupportedLink: (s) => {
-    if (!s) return false;
-    return /\b(tiktok\.com|vm\.tiktok\.com|youtube\.com|youtu\.be)\b/i.test(s);
-  }
+  isSupportedLink: (s) => { if (!s) return false; return /\b(tiktok\.com|vm\.tiktok\.com|youtube\.com|youtu\.be)\b/i.test(s); }
 };
