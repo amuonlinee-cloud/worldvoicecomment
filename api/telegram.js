@@ -1,23 +1,16 @@
 // api/telegram.js
-// CommonJS style — serverless-friendly webhook for Telegraf
+// Serverless webhook handler for Vercel — safe single-response pattern
 
 const { initBot } = require('../src/bot');
 
-let botPromise; // keep the bot instance across cold-starts in module scope
+let botPromise;
 
-// Optional secret to match Telegram secret_token header (recommended)
 const EXPECTED_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || null;
 
 module.exports = async (req, res) => {
-  // health check
-  if (req.method === 'GET') {
-    return res.status(200).send('OK - Telegram webhook endpoint');
-  }
-
-  // only allow POST for webhook updates
+  if (req.method === 'GET') return res.status(200).send('OK - Telegram webhook endpoint');
   if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
 
-  // optional secret header check
   if (EXPECTED_SECRET) {
     const header = req.headers['x-telegram-bot-api-secret-token'];
     if (!header || header !== EXPECTED_SECRET) {
@@ -26,7 +19,6 @@ module.exports = async (req, res) => {
     }
   }
 
-  // parse update safely — Vercel sometimes gives rawBody or parsed body
   let update = req.body;
   try {
     if (!update || (typeof update !== 'object') || Object.keys(update).length === 0) {
@@ -35,23 +27,17 @@ module.exports = async (req, res) => {
       }
     }
   } catch (e) {
-    console.error('Failed to parse request body', e);
+    console.error('Failed to parse request body', e && e.message);
     return res.status(400).send('Bad Request');
   }
 
   try {
-    if (!botPromise) botPromise = initBot(); // returns Telegraf instance (your src/bot.js)
+    if (!botPromise) botPromise = initBot();
     const bot = await botPromise;
-
-    // Pass update only. Do NOT pass the express "res" object to Telegraf.
-    // handleUpdate is serverless-friendly.
     await bot.handleUpdate(update);
-
-    // Send exactly one 200 response here
     return res.status(200).send('OK');
   } catch (err) {
-    console.error('telegram webhook handler error', err && (err.stack || err.message || err));
-    // Return 500 so you can see the error in Vercel logs during debugging.
+    console.error('telegram webhook handler error', err && (err.stack || err.message));
     return res.status(500).send('Server error');
   }
 };
