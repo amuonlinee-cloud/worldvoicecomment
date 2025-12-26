@@ -2,7 +2,7 @@
 // robust normalizeVideoUrl, extractFirstUrl, encode/decode codes
 const URL_RE = /(https?:\/\/[^\s)]+)/i;
 
-// follow redirects for vm.tiktok if possible
+// follow redirects for short tiktok links
 async function _fetchFollow(url, timeout=5000) {
   if (typeof fetch === 'undefined') throw new Error('fetch not available');
   const ac = new AbortController();
@@ -74,7 +74,6 @@ async function normalizeVideoUrl(link) {
     const m = raw.match(/tiktok\.com\/.*\/video\/([0-9]+)/i);
     if (m) {
       const id = m[1];
-      // best we can do
       return { provider: 'tiktok', id: String(id), canonicalLink: _cleanUrl(raw), thumbnail: null };
     }
   } catch (e) {}
