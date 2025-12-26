@@ -1,9 +1,9 @@
 // src/database.js
-// Supabase wrapper used by bot.js — it requires SUPABASE_URL and SUPABASE_KEY envs.
+// Supabase wrapper used by bot.js — requires SUPABASE_URL and SUPABASE_KEY envs.
 // Exports functions used by src/bot.js: ensureUserRow, findOrCreateThread, listThreadsByCreator,
 // createPaymentRequest, updatePaymentStatus, insertVoiceComment, listCommentsByThread, getCommentById,
-// insertReplyRow, listReplies, toggleFavoriteRow, isFavorite, insertReactionRow,
-// addNotificationRow, listNotifications, listCommentsByUser, deleteCommentById, deleteThreadById, supabase
+// insertReplyRow, listReplies, toggleFavoriteRow, listFavoritesForUser, insertReactionRow,
+// addNotificationRow, listNotifications, insertReport, deleteCommentById, deleteThreadById, supabase
 
 const { createClient } = require('@supabase/supabase-js');
 const utils = require('./utils');
@@ -259,6 +259,7 @@ module.exports = {
   listReplies,
   toggleFavoriteRow,
   isFavorite,
+  listFavoritesForUser,
   insertReactionRow,
   addNotificationRow,
   listNotifications,
