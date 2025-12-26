@@ -1,146 +1,95 @@
 // src/utils.js
-// utilities: normalizeVideoUrl with redirect resolve for short TikTok links, encode/decode short codes, extract url.
+// robust normalizeVideoUrl, extractFirstUrl, encode/decode codes
+const URL_RE = /(https?:\/\/[^\s)]+)/i;
 
-const URL_RE = /(https?:\/\/[^\s]+)/i;
-
-// helper fetch with timeout - node fetch in Vercel available in Node 18+; fallback will error and be caught
-async function _fetchWithTimeout(url, opts = {}, timeout = 5000) {
-  if (typeof fetch !== 'undefined') {
-    const controller = new AbortController();
-    const id = setTimeout(() => controller.abort(), timeout);
-    try {
-      const res = await fetch(url, Object.assign({}, opts, { signal: controller.signal, redirect: 'follow' }));
-      clearTimeout(id);
-      return res;
-    } catch (e) {
-      clearTimeout(id);
-      throw e;
-    }
-  } else {
-    throw new Error('fetch not available');
-  }
-}
-
-function normalizeInput(s) {
-  if (s === undefined || s === null) return '';
-  return String(s).trim();
+// follow redirects for vm.tiktok if possible
+async function _fetchFollow(url, timeout=5000) {
+  if (typeof fetch === 'undefined') throw new Error('fetch not available');
+  const ac = new AbortController();
+  const id = setTimeout(() => ac.abort(), timeout);
+  try {
+    const res = await fetch(url, { method: 'GET', redirect: 'follow', signal: ac.signal });
+    clearTimeout(id);
+    return res;
+  } catch (e) { clearTimeout(id); throw e; }
 }
 
 function extractFirstUrl(text) {
   if (!text) return null;
   const m = String(text).match(URL_RE);
-  return m ? m[1] : null;
+  return m ? m[1].replace(/[),.]+$/,'') : null;
 }
 
-function isSupportedLink(s) {
-  if (!s) return false;
-  s = String(s);
-  return /tiktok\.com|youtube\.com|youtu\.be|vm\.tiktok\.com/i.test(s);
-}
-
-function _normalizeUrlForDb(raw) {
+function _cleanUrl(raw) {
   if (!raw) return raw;
-  let str = String(raw).trim();
-  str = str.replace(/[)\]\.,]+$/g, '').trim();
+  let s = String(raw).trim();
+  s = s.replace(/[)\]\.]+$/g, '');
   try {
-    const u = new URL(str);
+    const u = new URL(s);
     u.hostname = u.hostname.toLowerCase();
-    u.pathname = u.pathname.replace(/\/+$/g, '');
-    u.pathname = u.pathname.toLowerCase();
-    let search = '';
-    if (/youtube\.com$/i.test(u.hostname) && u.search) search = u.search;
-    const clean = `${u.protocol}//${u.hostname}${u.pathname}${search}`;
-    return clean.replace(/\/$/,'');
-  } catch (e) { return str.toLowerCase().replace(/\/$/,''); }
+    u.pathname = u.pathname.replace(/\/+$/,'');
+    // keep v param for youtube
+    const search = (u.searchParams && (u.searchParams.get('v') ? `?v=${u.searchParams.get('v')}` : '')) || '';
+    return `${u.protocol}//${u.hostname}${u.pathname}${search}`.replace(/\/$/,'');
+  } catch (e) {
+    return s.toLowerCase().replace(/\/$/,'');
+  }
 }
 
-/**
- * normalizeVideoUrl(link)
- * returns { canonicalLink, provider, id }
- */
 async function normalizeVideoUrl(link) {
-  if (!link) return { canonicalLink: link };
-  let raw = String(link).trim();
-  raw = raw.replace(/[)\]\.]+$/g, '').trim();
-
-  // If short TikTok (vm.tiktok.com), try to follow redirect to full link
+  if (!link) return { canonicalLink: null };
+  let raw = String(link).trim().replace(/[)\]\.]+$/g,'');
+  // follow short tiktok redirects
   try {
-    const tmp = new URL(raw);
-    const host = tmp.hostname.toLowerCase();
+    const u = new URL(raw);
+    const host = u.hostname.toLowerCase();
     if (host.includes('vm.tiktok.com') || host.includes('vt.tiktok.com')) {
       try {
-        const res = await _fetchWithTimeout(raw, { method: 'GET' }, 6000);
-        if (res && res.url) raw = String(res.url).trim();
+        const r = await _fetchFollow(raw, 5000);
+        if (r && r.url) raw = r.url;
       } catch (e) {
-        // ignore fetch failures
+        // ignore
       }
     }
   } catch (e) {}
 
-  // YouTube checks
-  const ytShort = raw.match(/youtu\.be\/([A-Za-z0-9_\-]+)/i);
-  if (ytShort) {
-    const id = ytShort[1];
-    const canonical = `https://www.youtube.com/watch?v=${id}`;
-    return { provider: 'youtube', id, canonicalLink: _normalizeUrlForDb(canonical) };
-  }
-  const ytFull = raw.match(/[?&]v=([A-Za-z0-9_\-]+)/i);
-  if (ytFull) {
-    const id = ytFull[1];
-    const canonical = `https://www.youtube.com/watch?v=${id}`;
-    return { provider: 'youtube', id, canonicalLink: _normalizeUrlForDb(canonical) };
-  }
-  const ytEmbed = raw.match(/\/embed\/([A-Za-z0-9_\-]+)/i);
-  if (ytEmbed) {
-    const id = ytEmbed[1];
-    const canonical = `https://www.youtube.com/watch?v=${id}`;
-    return { provider: 'youtube', id, canonicalLink: _normalizeUrlForDb(canonical) };
-  }
+  // YouTube cases
+  try {
+    const u = new URL(raw);
+    const host = u.hostname.toLowerCase();
+    if (host.includes('youtu.be')) {
+      const vid = u.pathname.split('/').filter(Boolean)[0];
+      if (vid) return { provider: 'youtube', id: vid, canonicalLink: _cleanUrl(`https://www.youtube.com/watch?v=${vid}`), thumbnail: `https://img.youtube.com/vi/${vid}/hqdefault.jpg` };
+    }
+    if (host.includes('youtube.com')) {
+      const v = u.searchParams.get('v');
+      if (v) return { provider: 'youtube', id: v, canonicalLink: _cleanUrl(`https://www.youtube.com/watch?v=${v}`), thumbnail: `https://img.youtube.com/vi/${v}/hqdefault.jpg` };
+      const embed = u.pathname.match(/\/embed\/([A-Za-z0-9_\-]+)/);
+      if (embed) return { provider: 'youtube', id: embed[1], canonicalLink: _cleanUrl(`https://www.youtube.com/watch?v=${embed[1]}`), thumbnail: `https://img.youtube.com/vi/${embed[1]}/hqdefault.jpg` };
+    }
+  } catch (e) {}
 
-  // TikTok detection
-  const ttLong = raw.match(/tiktok\.com\/.*\/video\/([0-9]+)/i);
-  if (ttLong) {
-    const id = ttLong[1];
-    const canonical = `https://www.tiktok.com/@video/${id}`;
-    return { provider: 'tiktok', id: String(id), canonicalLink: _normalizeUrlForDb(canonical) };
-  }
-  const ttV = raw.match(/tiktok\.com\/v\/([0-9]+)/i) || raw.match(/\/v\/([0-9]+)\.html/i);
-  if (ttV) {
-    const id = ttV[1];
-    const canonical = `https://www.tiktok.com/@video/${id}`;
-    return { provider: 'tiktok', id: String(id), canonicalLink: _normalizeUrlForDb(canonical) };
-  }
-  const ttShort = raw.match(/vm\.tiktok\.com\/([A-Za-z0-9\/\-_]+)/i);
-  if (ttShort) {
-    return { provider: 'tiktok', canonicalLink: _normalizeUrlForDb(raw) };
-  }
+  // TikTok long link
+  try {
+    const m = raw.match(/tiktok\.com\/.*\/video\/([0-9]+)/i);
+    if (m) {
+      const id = m[1];
+      // best we can do
+      return { provider: 'tiktok', id: String(id), canonicalLink: _cleanUrl(raw), thumbnail: null };
+    }
+  } catch (e) {}
 
-  // instagram reels
-  const ig = raw.match(/instagram\.com\/(?:reel|p)\/([A-Za-z0-9_\-]+)/i);
-  if (ig) {
-    const id = ig[1];
-    const canonical = `https://www.instagram.com/p/${id}`;
-    return { provider: 'instagram', id, canonicalLink: _normalizeUrlForDb(canonical) };
-  }
-
-  return { canonicalLink: _normalizeUrlForDb(raw) };
+  return { canonicalLink: _cleanUrl(raw) };
 }
 
 function encodeShortCode(id) {
   if (id === undefined || id === null) return '';
-  const v = Number(id) || 0;
-  return v.toString(36).toUpperCase().padStart(6, '0');
+  const n = Number(id) || 0;
+  return n.toString(36).toUpperCase().padStart(6, '0');
 }
 function decodeShortCode(code) {
   if (!code) return null;
-  try { return parseInt(String(code).toLowerCase(), 36); } catch(e) { return null; }
+  try { return parseInt(String(code).toLowerCase(), 36); } catch (e) { return null; }
 }
 
-module.exports = {
-  normalizeInput,
-  extractFirstUrl,
-  isSupportedLink,
-  normalizeVideoUrl,
-  encodeShortCode,
-  decodeShortCode
-};
+module.exports = { extractFirstUrl, normalizeVideoUrl, _cleanUrl: _cleanUrl, encodeShortCode, decodeShortCode };
