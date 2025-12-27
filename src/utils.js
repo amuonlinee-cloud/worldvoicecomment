@@ -1,19 +1,8 @@
 // src/utils.js
-// robust normalizeVideoUrl, extractFirstUrl, encode/decode codes
+// helpers: extractFirstUrl, normalizeVideoUrl, encode/decode short codes, clean url
 const URL_RE = /(https?:\/\/[^\s)]+)/i;
 
-// follow redirects for short tiktok links
-async function _fetchFollow(url, timeout=5000) {
-  if (typeof fetch === 'undefined') throw new Error('fetch not available');
-  const ac = new AbortController();
-  const id = setTimeout(() => ac.abort(), timeout);
-  try {
-    const res = await fetch(url, { method: 'GET', redirect: 'follow', signal: ac.signal });
-    clearTimeout(id);
-    return res;
-  } catch (e) { clearTimeout(id); throw e; }
-}
-
+// extract first URL in text
 function extractFirstUrl(text) {
   if (!text) return null;
   const m = String(text).match(URL_RE);
@@ -29,13 +18,33 @@ function _cleanUrl(raw) {
     u.hostname = u.hostname.toLowerCase();
     u.pathname = u.pathname.replace(/\/+$/,'');
     // keep v param for youtube
-    const search = (u.searchParams && (u.searchParams.get('v') ? `?v=${u.searchParams.get('v')}` : '')) || '';
+    const v = u.searchParams.get('v');
+    const search = v ? `?v=${v}` : '';
     return `${u.protocol}//${u.hostname}${u.pathname}${search}`.replace(/\/$/,'');
   } catch (e) {
     return s.toLowerCase().replace(/\/$/,'');
   }
 }
 
+// follow redirects for short links (vm.tiktok)
+async function _fetchFollow(url, timeout=5000) {
+  if (typeof fetch === 'undefined') {
+    // node 18+ has fetch; if not available, fallback to returning original
+    return { url };
+  }
+  const ac = new AbortController();
+  const id = setTimeout(() => ac.abort(), timeout);
+  try {
+    const res = await fetch(url, { method: 'GET', redirect: 'follow', signal: ac.signal });
+    clearTimeout(id);
+    return res;
+  } catch (e) {
+    clearTimeout(id);
+    throw e;
+  }
+}
+
+// normalizeVideoUrl: returns { canonicalLink, provider, id, thumbnail? }
 async function normalizeVideoUrl(link) {
   if (!link) return { canonicalLink: null };
   let raw = String(link).trim().replace(/[)\]\.]+$/g,'');
@@ -47,13 +56,11 @@ async function normalizeVideoUrl(link) {
       try {
         const r = await _fetchFollow(raw, 5000);
         if (r && r.url) raw = r.url;
-      } catch (e) {
-        // ignore
-      }
+      } catch (e) { /* ignore */ }
     }
   } catch (e) {}
 
-  // YouTube cases
+  // YouTube short and normal
   try {
     const u = new URL(raw);
     const host = u.hostname.toLowerCase();
@@ -69,7 +76,7 @@ async function normalizeVideoUrl(link) {
     }
   } catch (e) {}
 
-  // TikTok long link
+  // tiktok long link
   try {
     const m = raw.match(/tiktok\.com\/.*\/video\/([0-9]+)/i);
     if (m) {
@@ -91,4 +98,10 @@ function decodeShortCode(code) {
   try { return parseInt(String(code).toLowerCase(), 36); } catch (e) { return null; }
 }
 
-module.exports = { extractFirstUrl, normalizeVideoUrl, _cleanUrl: _cleanUrl, encodeShortCode, decodeShortCode };
+module.exports = {
+  extractFirstUrl,
+  normalizeVideoUrl,
+  _cleanUrl,
+  encodeShortCode,
+  decodeShortCode
+};
