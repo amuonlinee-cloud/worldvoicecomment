@@ -1,97 +1,109 @@
 // src/database.js
 // Supabase wrapper used by bot.js — requires SUPABASE_URL and SUPABASE_KEY envs.
-// Exports supabase and all helper functions used by bot.js.
+// Exports supabase client + helper functions used by bot.js.
 
 const { createClient } = require('@supabase/supabase-js');
-const utils = require('./utils');
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
-if (!SUPABASE_URL || !SUPABASE_KEY) throw new Error('Missing SUPABASE_URL or SUPABASE_KEY env var.');
+if (!SUPABASE_URL || !SUPABASE_KEY) {
+  throw new Error('Missing SUPABASE_URL or SUPABASE_KEY env var.');
+}
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSession: false } });
 
-// helper to safely maybeSingle select
-async function _maybeSingle(query) {
+/* ---- Helpers ---- */
+async function safeMaybeSingle(query) {
+  // query is a supabase query promise
   try {
-    const res = await query.maybeSingle();
+    // For new supabase client patterns (returns { data, error })
+    const res = await query;
+    if (res && typeof res.maybeSingle === 'function') {
+      // rarely used path
+      return await res.maybeSingle();
+    }
     return res;
   } catch (e) {
-    // older supabase clients may return { data, error }
-    try {
-      const r = await query;
-      return r;
-    } catch (err) {
-      throw err;
-    }
-  }
-}
-
-async function ensureUserRow(user) {
-  if (!user || !user.id) return null;
-  try {
-    const row = {
-      telegram_id: user.id,
-      username: user.username || null,
-      first_name: user.first_name || null,
-      updated_at: new Date().toISOString()
-    };
-    const { data, error } = await supabase.from('users').upsert(row, { onConflict: ['telegram_id'] }).select().maybeSingle();
-    if (error) throw error;
-    return data;
-  } catch (e) {
-    console.error('ensureUserRow err', e && e.message);
     throw e;
   }
 }
 
+/* ---- Users ---- */
+async function ensureUserRow(user) {
+  if (!user || !user.id) return null;
+  const row = {
+    telegram_id: Number(user.id),
+    username: user.username || null,
+    first_name: user.first_name || null,
+    updated_at: new Date().toISOString()
+  };
+  try {
+    const { data, error } = await supabase
+      .from('users')
+      .upsert(row, { onConflict: ['telegram_id'], returning: 'representation' })
+      .select()
+      .maybeSingle();
+    if (error) throw error;
+    return data;
+  } catch (e) {
+    console.error('ensureUserRow err', e);
+    throw e;
+  }
+}
+
+/* ---- Threads (videos) ----
+  columns used:
+    id, social_link, canonical_link, provider, provider_id, creator_telegram_id, created_at
+*/
 async function findOrCreateThread(link, creatorTelegramId = null) {
   if (!link) throw new Error('Missing link');
   try {
-    const normalized = await utils.normalizeVideoUrl(link).catch(()=>({ canonicalLink: link }));
-    const candidates = [];
-    if (normalized && normalized.canonicalLink) candidates.push(normalized.canonicalLink.toLowerCase());
-    candidates.push(String(link).trim().replace(/[)\]\.]+$/g,'').toLowerCase());
+    // canonicalization/normalization is done outside (utils.normalizeVideoUrl)
+    // We'll search by social_link or canonical_link or provider/provider_id.
+    const normalizedCanonical = String(link).trim().toLowerCase();
 
-    // try to find by canonical or social link
-    for (const cand of candidates) {
-      try {
-        const { data } = await supabase.from('threads').select('*').or(`canonical_link.ilike.${cand},social_link.ilike.${cand}`).limit(1).maybeSingle();
-        if (data) return data;
-      } catch (_) {}
+    // Try exact match on social_link OR canonical_link
+    const { data: found1, error: e1 } = await supabase
+      .from('threads')
+      .select('*')
+      .or(`social_link.eq.${normalizedCanonical},canonical_link.eq.${normalizedCanonical}`)
+      .limit(1)
+      .maybeSingle();
+
+    if (e1) {
+      // continue, but log
+      console.warn('findOrCreateThread search err', e1.message || e1);
+    }
+    if (found1) {
+      // optionally set creator_telegram_id if provided and not set
+      if (creatorTelegramId && !found1.creator_telegram_id) {
+        try {
+          await supabase.from('threads').update({ creator_telegram_id: creatorTelegramId }).eq('id', found1.id);
+          found1.creator_telegram_id = creatorTelegramId;
+        } catch (uerr) { /* ignore */ }
+      }
+      return found1;
     }
 
-    // provider/id match
-    if (normalized && normalized.provider && normalized.id) {
-      try {
-        const { data } = await supabase.from('threads').select('*').eq('provider', normalized.provider).eq('provider_id', String(normalized.id)).limit(1).maybeSingle();
-        if (data) return data;
-      } catch (_) {}
-    }
-
-    // insert new thread
+    // Insert new thread
     const row = {
       social_link: link,
-      canonical_link: normalized && normalized.canonicalLink ? normalized.canonicalLink : null,
-      provider: normalized && normalized.provider ? normalized.provider : null,
-      provider_id: normalized && normalized.id ? String(normalized.id) : null,
+      canonical_link: null,
+      provider: null,
+      provider_id: null,
       creator_telegram_id: creatorTelegramId || null,
       created_at: new Date().toISOString()
     };
     const { data, error } = await supabase.from('threads').insert([row]).select().maybeSingle();
     if (error) {
-      // try to re-fetch
-      for (const cand of candidates) {
-        try {
-          const { data: retry } = await supabase.from('threads').select('*').or(`canonical_link.ilike.${cand},social_link.ilike.${cand}`).limit(1).maybeSingle();
-          if (retry) return retry;
-        } catch (_) {}
-      }
+      // Attempt a forgiving re-fetch (race)
+      const { data: refetch } = await supabase.from('threads').select('*').or(`social_link.eq.${normalizedCanonical},canonical_link.eq.${normalizedCanonical}`).limit(1).maybeSingle();
+      if (refetch) return refetch;
       throw error;
     }
     return data;
   } catch (e) {
-    console.error('findOrCreateThread err', e && e.message);
+    console.error('findOrCreateThread err', e);
     throw e;
   }
 }
@@ -102,7 +114,7 @@ async function getThreadById(id) {
     const { data } = await supabase.from('threads').select('*').eq('id', id).limit(1).maybeSingle();
     return data || null;
   } catch (e) {
-    console.error('getThreadById err', e && e.message);
+    console.error('getThreadById err', e);
     return null;
   }
 }
@@ -112,41 +124,58 @@ async function listThreadsByCreator(telegramId) {
     const { data, error } = await supabase.from('threads').select('*').eq('creator_telegram_id', telegramId).order('created_at', { ascending: false });
     if (error) throw error;
     return data || [];
-  } catch (e) { console.error('listThreadsByCreator err', e); throw e; }
+  } catch (e) {
+    console.error('listThreadsByCreator err', e);
+    throw e;
+  }
 }
 
-/* Payments */
+/* ---- Payments ---- */
 async function createPaymentRequest(payload) {
   try {
     const insertRow = Object.assign({ status: 'pending', created_at: new Date().toISOString() }, payload);
     const { data, error } = await supabase.from('payment_requests').insert([insertRow]).select().maybeSingle();
     if (error) throw error;
     return data;
-  } catch (e) { console.error('createPaymentRequest err', e); throw e; }
+  } catch (e) {
+    console.error('createPaymentRequest err', e);
+    throw e;
+  }
 }
+
 async function getPaymentById(id) {
   try {
     const { data } = await supabase.from('payment_requests').select('*').eq('id', id).limit(1).maybeSingle();
     return data || null;
-  } catch (e) { console.error('getPaymentById err', e); throw e; }
+  } catch (e) {
+    console.error('getPaymentById err', e);
+    return null;
+  }
 }
+
 async function updatePaymentStatus(id, status, updates = {}) {
   try {
     const payload = Object.assign({ status }, updates);
     const { data, error } = await supabase.from('payment_requests').update(payload).eq('id', id).select().maybeSingle();
     if (error) throw error;
     return data;
-  } catch (e) { console.error('updatePaymentStatus err', e); throw e; }
+  } catch (e) {
+    console.error('updatePaymentStatus err', e);
+    throw e;
+  }
 }
 
-/* Voice comments */
+/* ---- Voice comments ---- */
 async function insertVoiceComment(row) {
   try {
     const insertRow = Object.assign({}, row, { created_at: new Date().toISOString() });
     const { data, error } = await supabase.from('voice_comments').insert([insertRow]).select().maybeSingle();
     if (error) throw error;
     return data;
-  } catch (e) { console.error('insertVoiceComment err', e && e.message); throw e; }
+  } catch (e) {
+    console.error('insertVoiceComment err', e);
+    throw e;
+  }
 }
 
 async function listCommentsByThread(threadId, offset = 0, limit = 15) {
@@ -154,7 +183,10 @@ async function listCommentsByThread(threadId, offset = 0, limit = 15) {
     const { data, error } = await supabase.from('voice_comments').select('*').eq('thread_id', threadId).order('created_at', { ascending: false }).range(offset, offset + limit - 1);
     if (error) throw error;
     return data || [];
-  } catch (e) { console.error('listCommentsByThread err', e && e.message); throw e; }
+  } catch (e) {
+    console.error('listCommentsByThread err', e);
+    throw e;
+  }
 }
 
 async function listCommentsByUser(telegramId, limit = 100) {
@@ -162,34 +194,47 @@ async function listCommentsByUser(telegramId, limit = 100) {
     const { data, error } = await supabase.from('voice_comments').select('*').eq('telegram_id', telegramId).order('created_at', { ascending: false }).limit(limit);
     if (error) throw error;
     return data || [];
-  } catch (e) { console.error('listCommentsByUser err', e && e.message); throw e; }
+  } catch (e) {
+    console.error('listCommentsByUser err', e);
+    throw e;
+  }
 }
 
 async function getCommentById(id) {
   try {
     const { data } = await supabase.from('voice_comments').select('*').eq('id', id).limit(1).maybeSingle();
     return data || null;
-  } catch (e) { console.error('getCommentById err', e && e.message); return null; }
+  } catch (e) {
+    console.error('getCommentById err', e);
+    return null;
+  }
 }
 
-/* Replies */
+/* ---- Replies ---- */
 async function insertReplyRow(row) {
   try {
     const insertRow = Object.assign({}, row, { created_at: new Date().toISOString() });
     const { data, error } = await supabase.from('replies').insert([insertRow]).select().maybeSingle();
     if (error) throw error;
     return data;
-  } catch (e) { console.error('insertReplyRow err', e && e.message); throw e; }
-}
-async function listReplies(commentId) {
-  try {
-    const { data, error } = await supabase.from('replies').select('*').eq('comment_id', commentId).order('created_at', { ascending: true });
-    if (error) throw error;
-    return data || [];
-  } catch (e) { console.error('listReplies err', e && e.message); throw e; }
+  } catch (e) {
+    console.error('insertReplyRow err', e);
+    throw e;
+  }
 }
 
-/* Favorites */
+async function listReplies(commentId, offset = 0, limit = 50) {
+  try {
+    const { data, error } = await supabase.from('replies').select('*').eq('comment_id', commentId).order('created_at', { ascending: true }).range(offset, offset + limit - 1);
+    if (error) throw error;
+    return data || [];
+  } catch (e) {
+    console.error('listReplies err', e);
+    throw e;
+  }
+}
+
+/* ---- Favorites ---- */
 async function toggleFavoriteRow(telegramId, commentId) {
   try {
     const { data: exists } = await supabase.from('favorites').select('*').eq('telegram_id', telegramId).eq('comment_id', commentId).limit(1).maybeSingle();
@@ -200,42 +245,58 @@ async function toggleFavoriteRow(telegramId, commentId) {
       const { data } = await supabase.from('favorites').insert([{ telegram_id: telegramId, comment_id: commentId }]).select().maybeSingle();
       return { removed: false, data };
     }
-  } catch (e) { console.error('toggleFavoriteRow err', e && e.message); throw e; }
+  } catch (e) {
+    console.error('toggleFavoriteRow err', e);
+    throw e;
+  }
 }
 
 async function listFavoritesForUser(telegramId) {
   try {
-    // return voice_comments joined via favorites table
+    // Join favorites -> voice_comments
     const { data } = await supabase.from('favorites').select('voice_comments(*)').eq('telegram_id', telegramId);
     const arr = (data || []).map(r => r.voice_comments).filter(Boolean);
     return arr;
-  } catch (e) { console.error('listFavoritesForUser err', e && e.message); return []; }
+  } catch (e) {
+    console.error('listFavoritesForUser err', e);
+    return [];
+  }
 }
 
-/* Reactions */
+/* ---- Reactions ---- */
 async function insertReactionRow(row) {
   try {
     const insertRow = Object.assign({}, row, { created_at: new Date().toISOString() });
     const { data, error } = await supabase.from('reactions').insert([insertRow]).select().maybeSingle();
     if (error) throw error;
     return data;
-  } catch (e) { console.error('insertReactionRow err', e && e.message); throw e; }
+  } catch (e) {
+    console.error('insertReactionRow err', e);
+    throw e;
+  }
 }
 
-/* Notifications & Reports */
+/* ---- Notifications & Reports ---- */
 async function addNotificationRow(row) {
   try {
     const insertRow = Object.assign({}, row, { created_at: new Date().toISOString() });
     const { data, error } = await supabase.from('notifications').insert([insertRow]).select().maybeSingle();
     if (error) throw error;
     return data;
-  } catch (e) { console.error('addNotificationRow err', e && e.message); throw e; }
+  } catch (e) {
+    console.error('addNotificationRow err', e);
+    throw e;
+  }
 }
+
 async function listNotifications(telegramId) {
   try {
     const { data } = await supabase.from('notifications').select('*').eq('telegram_id', telegramId).order('created_at', { ascending: false }).limit(50);
     return data || [];
-  } catch (e) { console.error('listNotifications err', e && e.message); return []; }
+  } catch (e) {
+    console.error('listNotifications err', e);
+    return [];
+  }
 }
 
 async function insertReport(row) {
@@ -244,23 +305,28 @@ async function insertReport(row) {
     const { data, error } = await supabase.from('reports').insert([insertRow]).select().maybeSingle();
     if (error) throw error;
     return data;
-  } catch (e) { console.error('insertReport err', e && e.message); throw e; }
+  } catch (e) {
+    console.error('insertReport err', e);
+    throw e;
+  }
 }
 
-/* Delete helpers */
+/* ---- Delete helpers ---- */
 async function deleteCommentById(id) {
   try {
-    // delete favorites, reactions, replies belonging to this comment then comment
     await supabase.from('favorites').delete().eq('comment_id', id);
     await supabase.from('reactions').delete().eq('comment_id', id);
     await supabase.from('replies').delete().eq('comment_id', id);
     await supabase.from('voice_comments').delete().eq('id', id);
     return { deleted: true };
-  } catch (e) { console.error('deleteCommentById err', e && e.message); return { error: e }; }
+  } catch (e) {
+    console.error('deleteCommentById err', e);
+    return { error: e };
+  }
 }
+
 async function deleteThreadById(id) {
   try {
-    // delete comments & replies then thread
     const { data: comments } = await supabase.from('voice_comments').select('id').eq('thread_id', id);
     if (comments && comments.length) {
       for (const c of comments) {
@@ -269,7 +335,10 @@ async function deleteThreadById(id) {
     }
     await supabase.from('threads').delete().eq('id', id);
     return { deleted: true };
-  } catch (e) { console.error('deleteThreadById err', e && e.message); return { error: e }; }
+  } catch (e) {
+    console.error('deleteThreadById err', e);
+    return { error: e };
+  }
 }
 
 module.exports = {
