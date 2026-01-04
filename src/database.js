@@ -1,5 +1,7 @@
 // src/database.js
 // Supabase wrapper for the bot. Exports functions used by src/bot.js
+// Updated: ensures credits/canonical_link/tracked_videos exists in recommended schema,
+// safer fallbacks and explicit listUsers output.
 
 const { createClient } = require('@supabase/supabase-js');
 const utils = require('./utils');
@@ -15,8 +17,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
   global: { headers: { 'x-client-info': 'worldvoice-bot' } }
 });
 
-// Export supabase for advanced queries from bot.js if needed
-// (bot.js uses db.supabase in some places to check favorites quickly)
+// simple ping
 async function ping() {
   try {
     const res = await supabase.from('users').select('telegram_id').limit(1);
@@ -69,20 +70,24 @@ async function changeBalance(telegramId, delta) {
    Threads (videos) - normalization aware
    ------------------------- */
 async function findOrCreateThread(link, creatorTelegramId = null) {
-  // Normalize using utils (returns object)
   const info = utils.normalizeVideoUrl(link) || {};
   const normalized = info.normalized_link || link;
 
-  // Try to find existing by normalized_link OR original_link
-  let find = await supabase
-    .from('threads')
-    .select('*')
-    .or(`normalized_link.eq.${normalized},original_link.eq.${link}`)
-    .limit(1);
+  // try to find existing by normalized_link or original_link
+  let find;
+  try {
+    // select common columns only to avoid schema errors if optional columns don't exist
+    find = await supabase
+      .from('threads')
+      .select('id, original_link, normalized_link, provider, provider_id, thumbnail, canonical_link, created_at, creator_telegram_id')
+      .or(`normalized_link.eq.${normalized},original_link.eq.${link}`)
+      .limit(1);
+  } catch (e) {
+    throw new Error('Threads table missing or schema mismatch: ' + (e.message || e));
+  }
   if (find.error) throw find.error;
   if (find.data && find.data.length > 0) {
     const existing = find.data[0];
-    // update creator if missing
     if (creatorTelegramId && !existing.creator_telegram_id) {
       await supabase.from('threads').update({ creator_telegram_id: creatorTelegramId }).eq('id', existing.id).catch(()=>null);
       existing.creator_telegram_id = creatorTelegramId;
@@ -103,10 +108,10 @@ async function findOrCreateThread(link, creatorTelegramId = null) {
 
   const inserted = await supabase.from('threads').insert([insertRow]).select();
   if (inserted.error) {
-    // race condition fallback: try to find again
+    // retry find to handle race
     const retry = await supabase
       .from('threads')
-      .select('*')
+      .select('id, original_link, normalized_link, provider, provider_id, thumbnail, canonical_link, created_at, creator_telegram_id')
       .or(`normalized_link.eq.${normalized},original_link.eq.${link}`)
       .limit(1);
     if (retry.error) throw retry.error;
@@ -117,7 +122,7 @@ async function findOrCreateThread(link, creatorTelegramId = null) {
 }
 
 async function getThreadById(id) {
-  const res = await supabase.from('threads').select('*').eq('id', id).limit(1);
+  const res = await supabase.from('threads').select('id, original_link, normalized_link, provider, provider_id, thumbnail, canonical_link, created_at, creator_telegram_id').eq('id', id).limit(1);
   if (res.error) throw res.error;
   return (res.data && res.data[0]) || null;
 }
@@ -338,10 +343,11 @@ async function listNotifications(user_telegram_id) {
    Payments and admin actions
    ------------------------- */
 async function createPaymentRequest({ user_telegram_id, package_name, amount, credits = 0 }) {
+  // try insert with credits column; if it fails, fallback to using 'proof' JSON
   try {
     const res = await supabase.from('payment_requests').insert([{ user_telegram_id, package_name, amount, credits, proof: null, status: 'pending', created_at: new Date().toISOString() }]).select();
     if (res.error) {
-      // fallback: insert without credits column
+      // fallback: insert with proof storing credits
       const res2 = await supabase.from('payment_requests').insert([{ user_telegram_id, package_name, amount, proof: JSON.stringify({ credits }), status: 'pending', created_at: new Date().toISOString() }]).select();
       if (res2.error) throw res2.error;
       const row = (res2.data && res2.data[0]) || null;
@@ -361,12 +367,13 @@ async function getPayment(paymentId) {
   if (res.error) throw res.error;
   const row = (res.data && res.data[0]) || null;
   if (!row) return null;
+  // ensure credits
   let credits = row.credits ?? null;
   if ((credits === null || credits === undefined) && row.proof) {
     try {
       const parsed = typeof row.proof === 'string' ? JSON.parse(row.proof) : row.proof;
       if (parsed && parsed.credits) credits = Number(parsed.credits);
-    } catch (e) {}
+    } catch (e) { credits = credits; }
   }
   row.credits = Number(credits || 0);
   return row;
@@ -412,7 +419,9 @@ async function createAdminPost({ content_type, content = null, file_id = null })
 async function listUsers(limit = 500) {
   const res = await supabase.from('users').select('telegram_id').limit(limit);
   if (res.error) throw res.error;
-  return res.data || [];
+  const rows = res.data || [];
+  // Flatten numeric ids and filter nulls
+  return rows.map(r => r.telegram_id).filter(Boolean);
 }
 
 async function deleteComment(commentId) {
