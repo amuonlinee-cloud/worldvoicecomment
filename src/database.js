@@ -1,91 +1,69 @@
 // src/database.js
-// Supabase wrapper matching bot.js (tracking, comments, replies, payments, favorites, reactions, notifications, reports)
-
 const { createClient } = require('@supabase/supabase-js');
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
-if (!SUPABASE_URL || !SUPABASE_KEY) {
-  throw new Error('Missing SUPABASE_URL or SUPABASE_KEY env vars.');
-}
+if (!SUPABASE_URL || !SUPABASE_KEY) throw new Error('Missing SUPABASE_URL or SUPABASE_KEY');
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
-  auth: { persistSession: false },
-  global: { headers: { 'x-from': 'worldvoice-bot' } }
-});
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSession: false } });
 
-/* --- Helper: safe single --- */
-async function maybeSingle(queryPromise) {
-  const res = await queryPromise;
-  // supabase v2 returns { data, error }
-  if (res && ('error' in res) && res.error) throw res.error;
-  return res.data ?? null;
-}
-
-/* --- Users --- */
-async function ensureUserRow(user) {
-  // Accept either object { id, username, first_name } or numeric id
-  const telegram_id = typeof user === 'object' && user.id ? Number(user.id) : Number(user);
-  if (!telegram_id) throw new Error('Invalid user id');
-  const row = {
-    telegram_id,
-    username: user && user.username ? user.username : null,
-    first_name: user && user.first_name ? user.first_name : null,
-    updated_at: new Date().toISOString()
-  };
-  const res = await supabase
-    .from('users')
-    .upsert(row, { onConflict: ['telegram_id'], returning: 'representation' })
-    .select()
-    .maybeSingle();
+// Helper to safely return .data or throw error
+async function runQuery(q) {
+  const res = await q;
   if (res.error) throw res.error;
   return res.data;
 }
 
-/* --- Threads (videos) --- */
+/* USERS */
+async function ensureUserRow(userOrId) {
+  const telegram_id = (typeof userOrId === 'object' && userOrId.id) ? Number(userOrId.id) : Number(userOrId);
+  if (!telegram_id) throw new Error('Invalid telegram id');
+  const up = {
+    telegram_id,
+    username: (userOrId && userOrId.username) ? userOrId.username : null,
+    first_name: (userOrId && userOrId.first_name) ? userOrId.first_name : null,
+    updated_at: new Date().toISOString()
+  };
+  const { data, error } = await supabase.from('users').upsert(up, { onConflict: ['telegram_id'], returning: 'representation' }).select().maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+/* THREADS */
 async function findOrCreateThread(link, creatorTelegramId = null) {
   if (!link) throw new Error('Missing link');
-  const normalized = String(link).trim();
+  const norm = await (async () => {
+    // dynamic import of utils to avoid cycles; but utils is simple so require
+    const utils = require('./utils');
+    return utils.normalizeVideoUrl(link);
+  })();
 
-  // Try to find by canonical_link or social_link or normalized_link
-  const { data: found, error: findErr } = await supabase
-    .from('threads')
-    .select('*')
-    .or(`social_link.eq.${normalized},canonical_link.eq.${normalized},normalized_link.eq.${normalized}`)
-    .limit(1)
-    .maybeSingle();
-  if (findErr) {
-    console.warn('findOrCreateThread findErr', findErr);
-  }
-  if (found) {
-    // update creator_telegram_id if provided and missing
-    if (creatorTelegramId && !found.creator_telegram_id) {
-      await supabase.from('threads').update({ creator_telegram_id: creatorTelegramId }).eq('id', found.id).catch(()=>null);
-      found.creator_telegram_id = creatorTelegramId;
+  const normalized_key = norm.normalized_link;
+  // try to find
+  const { data: existing } = await supabase.from('threads').select('*').or(`normalized_link.eq.${normalized_key},social_link.eq.${link},canonical_link.eq.${link}`).limit(1).maybeSingle();
+  if (existing) {
+    // update creator if missing
+    if (creatorTelegramId && !existing.creator_telegram_id) {
+      await supabase.from('threads').update({ creator_telegram_id: creatorTelegramId }).eq('id', existing.id).catch(()=>null);
+      existing.creator_telegram_id = creatorTelegramId;
     }
-    return found;
+    return existing;
   }
-
-  // insert new
-  const insert = {
+  // insert thread row
+  const insertRow = {
     social_link: link,
-    canonical_link: null,
-    normalized_link: normalized,
-    provider: null,
-    provider_id: null,
+    canonical_link: norm.canonical_link || link,
+    normalized_link: normalized_key,
+    provider: norm.provider || null,
+    provider_id: norm.provider_id || null,
     creator_telegram_id: creatorTelegramId || null,
     created_at: new Date().toISOString()
   };
-  const { data, error } = await supabase.from('threads').insert([insert]).select().maybeSingle();
+  const { data, error } = await supabase.from('threads').insert([insertRow]).select().maybeSingle();
   if (error) {
-    // race: try to re-fetch
-    const { data: re } = await supabase
-      .from('threads')
-      .select('*')
-      .or(`social_link.eq.${normalized},canonical_link.eq.${normalized},normalized_link.eq.${normalized}`)
-      .limit(1)
-      .maybeSingle();
-    if (re) return re;
+    // race - try fetch again
+    const { data: fallback } = await supabase.from('threads').select('*').or(`normalized_link.eq.${normalized_key},social_link.eq.${link},canonical_link.eq.${link}`).limit(1).maybeSingle();
+    if (fallback) return fallback;
     throw error;
   }
   return data;
@@ -98,45 +76,30 @@ async function getThreadById(id) {
   return data || null;
 }
 
-async function listThreadsByCreator(telegramId) {
-  const { data, error } = await supabase.from('threads').select('*').eq('creator_telegram_id', telegramId).order('created_at', { ascending: false });
-  if (error) throw error;
-  return data || [];
-}
-
-/* --- Tracked videos helpers --- */
+/* TRACKED VIDEOS (kept but not used in user thread actions) */
 async function trackThread(tracker_telegram_id, thread_id) {
-  if (!tracker_telegram_id || !thread_id) throw new Error('Missing args');
   const row = { tracker_telegram_id, thread_id, created_at: new Date().toISOString() };
-  const { data, error } = await supabase.from('tracked_videos').upsert(row, { onConflict: ['tracker_telegram_id', 'thread_id'], returning: 'representation' }).select().maybeSingle();
+  const { data, error } = await supabase.from('tracked_videos').upsert(row, { onConflict: ['tracker_telegram_id','thread_id'], returning: 'representation' }).select().maybeSingle();
   if (error) throw error;
   return data;
 }
-
 async function listTrackedByUser(tracker_telegram_id) {
-  const { data, error } = await supabase
-    .from('tracked_videos')
-    .select('id,thread_id,created_at,threads(*)')
-    .eq('tracker_telegram_id', tracker_telegram_id)
-    .order('created_at', { ascending: false });
+  const { data, error } = await supabase.from('tracked_videos').select('id,thread_id,created_at,threads(*)').eq('tracker_telegram_id', tracker_telegram_id).order('created_at', { ascending: false });
   if (error) throw error;
-  // flatten threads for convenience
   return (data || []).map(r => Object.assign({ id: r.id, thread_id: r.thread_id, created_at: r.created_at }, r.threads || {}));
 }
-
 async function listTrackersForThread(thread_id) {
   const { data, error } = await supabase.from('tracked_videos').select('*').eq('thread_id', thread_id);
   if (error) throw error;
   return data || [];
 }
-
 async function untrackThread(tracker_telegram_id, thread_id) {
   const { error } = await supabase.from('tracked_videos').delete().eq('tracker_telegram_id', tracker_telegram_id).eq('thread_id', thread_id);
   if (error) throw error;
   return { removed: true };
 }
 
-/* --- Payments --- */
+/* PAYMENTS */
 async function createPaymentRequest(payload) {
   const row = Object.assign({ status: 'pending', created_at: new Date().toISOString() }, payload);
   const { data, error } = await supabase.from('payment_requests').insert([row]).select().maybeSingle();
@@ -155,35 +118,31 @@ async function updatePaymentStatus(id, status, updates = {}) {
   return data;
 }
 
-/* --- Voice comments --- */
+/* VOICE COMMENTS */
 async function insertVoiceComment(row) {
   const insertRow = Object.assign({}, row, { created_at: new Date().toISOString() });
   const { data, error } = await supabase.from('voice_comments').insert([insertRow]).select().maybeSingle();
   if (error) throw error;
   return data;
 }
-
 async function listCommentsByThread(threadId, offset = 0, limit = 15) {
   const { data, error } = await supabase.from('voice_comments').select('*').eq('thread_id', threadId).order('created_at', { ascending: false }).range(offset, offset + limit - 1);
   if (error) throw error;
   return data || [];
 }
-
 async function listCommentsByUser(telegramId, limit = 100) {
   const { data, error } = await supabase.from('voice_comments').select('*').eq('telegram_id', telegramId).order('created_at', { ascending: false }).limit(limit);
   if (error) throw error;
   return data || [];
 }
-
 async function getCommentById(id) {
   const { data, error } = await supabase.from('voice_comments').select('*').eq('id', id).limit(1).maybeSingle();
   if (error) throw error;
   return data || null;
 }
 
-/* --- Replies --- */
+/* REPLIES */
 async function insertReplyRow(row) {
-  // Accepts row that may or may not contain duration; ensure only known columns passed
   const allowed = ['comment_id','replier_telegram_id','replier_username','replier_first_name','telegram_file_id','reply_text','duration','created_at'];
   const insertRow = {};
   for (const k of allowed) if (k in row) insertRow[k] = row[k];
@@ -198,28 +157,26 @@ async function listReplies(commentId, offset = 0, limit = 50) {
   return data || [];
 }
 
-/* --- Favorites --- */
+/* FAVORITES */
 async function toggleFavoriteRow(telegramId, commentId) {
-  const { data: exists, error: e } = await supabase.from('favorites').select('*').eq('telegram_id', telegramId).eq('comment_id', commentId).limit(1).maybeSingle();
-  if (e) throw e;
+  const { data: exists, error } = await supabase.from('favorites').select('*').eq('telegram_id', telegramId).eq('comment_id', commentId).limit(1).maybeSingle();
+  if (error) throw error;
   if (exists) {
     await supabase.from('favorites').delete().eq('id', exists.id);
     return { removed: true };
   } else {
-    const { data, error } = await supabase.from('favorites').insert([{ telegram_id: telegramId, comment_id: commentId }]).select().maybeSingle();
-    if (error) throw error;
-    return { removed: false, data };
+    const { data: d, error: e } = await supabase.from('favorites').insert([{ telegram_id: telegramId, comment_id: commentId }]).select().maybeSingle();
+    if (e) throw e;
+    return { removed: false, data: d };
   }
 }
 async function listFavoritesForUser(telegramId) {
-  // return voice_comments rows
   const { data, error } = await supabase.from('favorites').select('voice_comments(*)').eq('telegram_id', telegramId);
   if (error) throw error;
-  const arr = (data || []).map(r => r.voice_comments).filter(Boolean);
-  return arr;
+  return (data || []).map(r => r.voice_comments).filter(Boolean);
 }
 
-/* --- Reactions --- */
+/* REACTIONS */
 async function insertReactionRow(row) {
   const insertRow = Object.assign({}, row, { created_at: new Date().toISOString() });
   const { data, error } = await supabase.from('reactions').insert([insertRow]).select().maybeSingle();
@@ -227,7 +184,7 @@ async function insertReactionRow(row) {
   return data;
 }
 
-/* --- Notifications & Reports --- */
+/* NOTIFICATIONS & REPORTS */
 async function addNotificationRow(row) {
   const insertRow = Object.assign({}, row, { created_at: new Date().toISOString() });
   const { data, error } = await supabase.from('notifications').insert([insertRow]).select().maybeSingle();
@@ -246,27 +203,13 @@ async function insertReport(row) {
   return data;
 }
 
-/* --- Deletes --- */
+/* DELETES */
 async function deleteCommentById(id) {
   try {
     await supabase.from('favorites').delete().eq('comment_id', id);
     await supabase.from('reactions').delete().eq('comment_id', id);
     await supabase.from('replies').delete().eq('comment_id', id);
     await supabase.from('voice_comments').delete().eq('id', id);
-    return { deleted: true };
-  } catch (e) {
-    return { error: e };
-  }
-}
-async function deleteThreadById(id) {
-  try {
-    const { data: comments } = await supabase.from('voice_comments').select('id').eq('thread_id', id);
-    if (comments && comments.length) {
-      for (const c of comments) {
-        await deleteCommentById(c.id).catch(()=>null);
-      }
-    }
-    await supabase.from('threads').delete().eq('id', id);
     return { deleted: true };
   } catch (e) {
     return { error: e };
@@ -298,6 +241,5 @@ module.exports = {
   addNotificationRow,
   listNotifications,
   insertReport,
-  deleteCommentById,
-  deleteThreadById
+  deleteCommentById
 };
