@@ -1,107 +1,91 @@
 // src/utils.js
-// helpers: extractFirstUrl, normalizeVideoUrl, encode/decode short codes, clean url
-const URL_RE = /(https?:\/\/[^\s)]+)/i;
+// Simple helpers: URL extraction, normalize video links (YouTube/TikTok basic), shortcode encoding/decoding
 
-// extract first URL in text
+const URL_REGEX = /(https?:\/\/[^\s]+)/i;
+
 function extractFirstUrl(text) {
   if (!text) return null;
-  const m = String(text).match(URL_RE);
-  return m ? m[1].replace(/[),.]+$/,'') : null;
+  const m = text.match(URL_REGEX);
+  return m ? m[0] : null;
 }
 
-function _cleanUrl(raw) {
-  if (!raw) return raw;
-  let s = String(raw).trim();
-  s = s.replace(/[)\]\.]+$/g, '');
-  try {
-    const u = new URL(s);
-    u.hostname = u.hostname.toLowerCase();
-    u.pathname = u.pathname.replace(/\/+$/,'');
-    // keep v param for youtube
-    const v = u.searchParams.get('v');
-    const search = v ? `?v=${v}` : '';
-    return `${u.protocol}//${u.hostname}${u.pathname}${search}`.replace(/\/$/,'');
-  } catch (e) {
-    return s.toLowerCase().replace(/\/$/,'');
+function normalizeVideoUrl(raw) {
+  // returns { canonical_link, normalized_link, provider, provider_id, thumbnail }
+  if (!raw) return null;
+  const u = raw.trim();
+
+  // YouTube: youtu.be/<id> or watch?v=<id>
+  const yShort = u.match(/youtu\.be\/([A-Za-z0-9_\-]+)/i);
+  const yFull = u.match(/[?&]v=([A-Za-z0-9_\-]+)/i);
+  if (yShort || yFull) {
+    const id = (yShort && yShort[1]) || (yFull && yFull[1]);
+    if (id) {
+      return {
+        canonical_link: `https://www.youtube.com/watch?v=${id}`,
+        normalized_link: `youtube:${id}`,
+        provider: 'youtube',
+        provider_id: id,
+        thumbnail: `https://img.youtube.com/vi/${id}/hqdefault.jpg`
+      };
+    }
   }
-}
 
-// follow redirects for short links (vm.tiktok)
-async function _fetchFollow(url, timeout=5000) {
-  if (typeof fetch === 'undefined') {
-    // node 18+ has fetch; if not available, fallback to returning original
-    return { url };
+  // TikTok: try to detect /video/<id> or vm.tiktok short
+  const tFull = u.match(/tiktok\.com\/@([^\/]+)\/video\/([0-9]+)/i);
+  if (tFull) {
+    const id = tFull[2];
+    const user = tFull[1];
+    return {
+      canonical_link: `https://www.tiktok.com/@${user}/video/${id}`,
+      normalized_link: `tiktok:${id}`,
+      provider: 'tiktok',
+      provider_id: id,
+      thumbnail: null
+    };
   }
-  const ac = new AbortController();
-  const id = setTimeout(() => ac.abort(), timeout);
-  try {
-    const res = await fetch(url, { method: 'GET', redirect: 'follow', signal: ac.signal });
-    clearTimeout(id);
-    return res;
-  } catch (e) {
-    clearTimeout(id);
-    throw e;
+  const vmMatch = u.match(/vm\.tiktok\.com\/([A-Za-z0-9]+)/i);
+  if (vmMatch) {
+    const token = vmMatch[1];
+    // short link: use token as normalized key
+    return {
+      canonical_link: u,
+      normalized_link: `tiktok_vm:${token}`,
+      provider: 'tiktok',
+      provider_id: token,
+      thumbnail: null
+    };
   }
+
+  // Otherwise fallback to normalized as URL string
+  return {
+    canonical_link: u,
+    normalized_link: `url:${u}`,
+    provider: 'generic',
+    provider_id: null,
+    thumbnail: null
+  };
 }
 
-// normalizeVideoUrl: returns { canonicalLink, provider, id, thumbnail? }
-async function normalizeVideoUrl(link) {
-  if (!link) return { canonicalLink: null };
-  let raw = String(link).trim().replace(/[)\]\.]+$/g,'');
-  // follow short tiktok redirects
-  try {
-    const u = new URL(raw);
-    const host = u.hostname.toLowerCase();
-    if (host.includes('vm.tiktok.com') || host.includes('vt.tiktok.com')) {
-      try {
-        const r = await _fetchFollow(raw, 5000);
-        if (r && r.url) raw = r.url;
-      } catch (e) { /* ignore */ }
-    }
-  } catch (e) {}
-
-  // YouTube short and normal
-  try {
-    const u = new URL(raw);
-    const host = u.hostname.toLowerCase();
-    if (host.includes('youtu.be')) {
-      const vid = u.pathname.split('/').filter(Boolean)[0];
-      if (vid) return { provider: 'youtube', id: vid, canonicalLink: _cleanUrl(`https://www.youtube.com/watch?v=${vid}`), thumbnail: `https://img.youtube.com/vi/${vid}/hqdefault.jpg` };
-    }
-    if (host.includes('youtube.com')) {
-      const v = u.searchParams.get('v');
-      if (v) return { provider: 'youtube', id: v, canonicalLink: _cleanUrl(`https://www.youtube.com/watch?v=${v}`), thumbnail: `https://img.youtube.com/vi/${v}/hqdefault.jpg` };
-      const embed = u.pathname.match(/\/embed\/([A-Za-z0-9_\-]+)/);
-      if (embed) return { provider: 'youtube', id: embed[1], canonicalLink: _cleanUrl(`https://www.youtube.com/watch?v=${embed[1]}`), thumbnail: `https://img.youtube.com/vi/${embed[1]}/hqdefault.jpg` };
-    }
-  } catch (e) {}
-
-  // tiktok long link
-  try {
-    const m = raw.match(/tiktok\.com\/.*\/video\/([0-9]+)/i);
-    if (m) {
-      const id = m[1];
-      return { provider: 'tiktok', id: String(id), canonicalLink: _cleanUrl(raw), thumbnail: null };
-    }
-  } catch (e) {}
-
-  return { canonicalLink: _cleanUrl(raw) };
-}
-
+// short code encoding/decoding: use base36 uppercase
 function encodeShortCode(id) {
-  if (id === undefined || id === null) return '';
-  const n = Number(id) || 0;
-  return n.toString(36).toUpperCase().padStart(6, '0');
+  if (!id && id !== 0) return null;
+  const num = Number(id);
+  if (Number.isNaN(num)) return null;
+  // produce uppercase base36 string
+  return num.toString(36).toUpperCase();
 }
 function decodeShortCode(code) {
   if (!code) return null;
-  try { return parseInt(String(code).toLowerCase(), 36); } catch (e) { return null; }
+  try {
+    return parseInt(String(code).toLowerCase(), 36);
+  } catch (e) {
+    return null;
+  }
 }
 
 module.exports = {
   extractFirstUrl,
   normalizeVideoUrl,
-  _cleanUrl,
   encodeShortCode,
   decodeShortCode
 };
