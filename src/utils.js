@@ -1,83 +1,68 @@
 // src/utils.js
-// Simple helpers: URL extraction, normalize video links (YouTube/TikTok basic), shortcode encoding/decoding
+// Utility helpers: normalize video URL, extract url, encode/decode short codes.
 
+const YOUTUBE_REGEX = /(?:youtube\.com\/watch\?v=|youtu\.be\/)([A-Za-z0-9_-]{6,})/i;
+const TIKTOK_REGEX = /(?:tiktok\.com\/@[^\/]+\/video\/|vm\.tiktok\.com\/|vt\.tiktok\.com\/)(\d+)/i;
 const URL_REGEX = /(https?:\/\/[^\s]+)/i;
 
 function extractFirstUrl(text) {
-  if (!text) return null;
+  if (!text || typeof text !== 'string') return null;
   const m = text.match(URL_REGEX);
   return m ? m[0] : null;
 }
 
-function normalizeVideoUrl(raw) {
-  // returns { canonical_link, normalized_link, provider, provider_id, thumbnail }
-  if (!raw) return null;
-  const u = raw.trim();
+function normalizeVideoUrl(link) {
+  // Returns an object:
+  // { normalized_link, provider, provider_id, thumbnail, canonical_link }
+  if (!link || typeof link !== 'string') return { normalized_link: link };
+  const l = link.trim();
 
-  // YouTube: youtu.be/<id> or watch?v=<id>
-  const yShort = u.match(/youtu\.be\/([A-Za-z0-9_\-]+)/i);
-  const yFull = u.match(/[?&]v=([A-Za-z0-9_\-]+)/i);
-  if (yShort || yFull) {
-    const id = (yShort && yShort[1]) || (yFull && yFull[1]);
-    if (id) {
-      return {
-        canonical_link: `https://www.youtube.com/watch?v=${id}`,
-        normalized_link: `youtube:${id}`,
-        provider: 'youtube',
-        provider_id: id,
-        thumbnail: `https://img.youtube.com/vi/${id}/hqdefault.jpg`
-      };
-    }
+  // YouTube
+  const y = l.match(YOUTUBE_REGEX);
+  if (y && y[1]) {
+    const id = y[1];
+    const normalized = `youtube:${id}`;
+    const thumbnail = `https://img.youtube.com/vi/${id}/mqdefault.jpg`;
+    const canonical = `https://youtu.be/${id}`;
+    return { normalized_link: normalized, provider: 'youtube', provider_id: id, thumbnail, canonical_link: canonical };
   }
 
-  // TikTok: try to detect /video/<id> or vm.tiktok short
-  const tFull = u.match(/tiktok\.com\/@([^\/]+)\/video\/([0-9]+)/i);
-  if (tFull) {
-    const id = tFull[2];
-    const user = tFull[1];
-    return {
-      canonical_link: `https://www.tiktok.com/@${user}/video/${id}`,
-      normalized_link: `tiktok:${id}`,
-      provider: 'tiktok',
-      provider_id: id,
-      thumbnail: null
-    };
-  }
-  const vmMatch = u.match(/vm\.tiktok\.com\/([A-Za-z0-9]+)/i);
-  if (vmMatch) {
-    const token = vmMatch[1];
-    // short link: use token as normalized key
-    return {
-      canonical_link: u,
-      normalized_link: `tiktok_vm:${token}`,
-      provider: 'tiktok',
-      provider_id: token,
-      thumbnail: null
-    };
+  // TikTok
+  const t = l.match(TIKTOK_REGEX);
+  if (t && t[1]) {
+    const id = t[1];
+    const normalized = `tiktok:${id}`;
+    // TikTok thumbnails are not reliably available via static URL; set null
+    const canonical = `https://www.tiktok.com/share/video/${id}`;
+    return { normalized_link: normalized, provider: 'tiktok', provider_id: id, thumbnail: null, canonical_link: canonical };
   }
 
-  // Otherwise fallback to normalized as URL string
-  return {
-    canonical_link: u,
-    normalized_link: `url:${u}`,
-    provider: 'generic',
-    provider_id: null,
-    thumbnail: null
-  };
-}
-
-// short code encoding/decoding: use base36 uppercase
-function encodeShortCode(id) {
-  if (!id && id !== 0) return null;
-  const num = Number(id);
-  if (Number.isNaN(num)) return null;
-  // produce uppercase base36 string
-  return num.toString(36).toUpperCase();
-}
-function decodeShortCode(code) {
-  if (!code) return null;
+  // Other providers: use host path
   try {
-    return parseInt(String(code).toLowerCase(), 36);
+    const url = new URL(l);
+    // remove query strings for normalized path
+    const normalized = `${url.hostname}${url.pathname}`.replace(/\/+$/, '');
+    return { normalized_link: normalized, provider: url.hostname, provider_id: null, thumbnail: null, canonical_link: l };
+  } catch (e) {
+    return { normalized_link: l };
+  }
+}
+
+// Shortcode encoding/decoding: base36 uppercase
+function encodeShortCode(id) {
+  if (id === null || id === undefined) return null;
+  const n = Number(id);
+  if (!Number.isFinite(n)) return null;
+  return n.toString(36).toUpperCase();
+}
+
+function decodeShortCode(code) {
+  if (!code || typeof code !== 'string') return null;
+  try {
+    const cleaned = code.trim().replace(/[^A-Z0-9]/gi, '').toUpperCase();
+    const val = parseInt(cleaned, 36);
+    if (Number.isNaN(val)) return null;
+    return val;
   } catch (e) {
     return null;
   }
