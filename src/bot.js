@@ -1,265 +1,278 @@
 // src/bot.js
+// Full bot.js — main Telegraf flows for WorldVoiceComment
+// Requires matching src/database.js and src/utils.js to exist in the same project.
+
 const { Telegraf, Markup } = require('telegraf');
-const db = require('./database');
-const utils = require('./utils');
+const db = require('./database');   // will provide matching implementation next
+const utils = require('./utils');   // will provide matching implementation next
 
+// ----- Config / env vars -----
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+if (!BOT_TOKEN) throw new Error('TELEGRAM_BOT_TOKEN is required');
+
 const ADMIN_IDS = (process.env.ADMIN_IDS || '').split(',').map(s => s.trim()).filter(Boolean).map(Number);
-const WHATSAPP_ADMIN = (process.env.WHATSAPP_ADMIN || '').replace(/\D/g,'');
-const WHATSAPP_LINK = WHATSAPP_ADMIN ? `https://wa.me/${WHATSAPP_ADMIN}` : null;
+const SERVICE_WHATSAPP = process.env.WHATSAPP_ADMIN || null; // optional admin contact
 
-if (!BOT_TOKEN) throw new Error('Missing TELEGRAM_BOT_TOKEN');
+// Payment recipient info (display to users)
+const PAY_TELEBIRR_NUMBER = process.env.PAY_TELEBIRR_NUMBER || '0962058608';
+const PAY_CBE_NUMBER = process.env.PAY_CBE_NUMBER || '1000555367884';
+const PAY_RECIPIENT_NAME = process.env.PAY_RECIPIENT_NAME || 'WorldVoiceComment';
 
-const PAYMENT_RECIPIENT = {
-  telebirr_number: process.env.PAY_TELEBIRR_NUMBER || '0962058608',
-  cbe_number: process.env.PAY_CBE_NUMBER || '1000555367884',
-  telebirr_name: 'WorldVoiceComment',
-  cbe_name: 'WorldVoiceComment'
-};
-
+// Packages available for purchase
 const PAYMENT_PACKAGES = [
-  { id: 'pkg1', label: '25 comments - 12 ETB', credits: 25, amount: 12 },
-  { id: 'pkg2', label: '60 comments - 27 ETB', credits: 60, amount: 27 },
-  { id: 'pkg3', label: '130 comments - 49 ETB', credits: 130, amount: 49 },
-  { id: 'pkg4', label: '240 comments - 89 ETB', credits: 240, amount: 89 }
+  { id: 'p1', label: '25 comments — 12 ETB', credits: 25, amount: 12 },
+  { id: 'p2', label: '60 comments — 27 ETB', credits: 60, amount: 27 },
+  { id: 'p3', label: '130 comments — 49 ETB', credits: 130, amount: 49 },
+  { id: 'p4', label: '240 comments — 89 ETB', credits: 240, amount: 89 }
 ];
 
-function isAdmin(id) { return ADMIN_IDS.includes(Number(id)); }
+// ----- Helpers -----
+function isAdmin(telegramId) {
+  return ADMIN_IDS.includes(Number(telegramId));
+}
+
+// Pending actions map for each user: Map<telegramId, pendingObject>
 const Pending = new Map();
 
-function userKeyboard(isAdminUser = false) {
-  const base = [
+// Build the main keyboard shown to users; admin sees extra Post button
+function buildMainKeyboard(telegramId) {
+  const admin = isAdmin(telegramId);
+  const rows = [
     ['🎥 Add Comment', '🎧 Listen Comments'],
-    ['💬 My Comments', '🔎 Search'],
+    ['💬 My Comments', '🔎 Search Code'],
     ['⭐ Favorites', '🔔 Notifications'],
     ['🛒 Buy', '📞 Support'],
-    ['💰 Balance']
+    ['💰 Balance'],
   ];
-  if (isAdminUser) {
-    // add admin-only Post button
-    base[0].push('📣 Post'); // small trick: admin sees Post
-  }
-  return Markup.keyboard(base, { columns: 2 }).resize();
+  // Make Post visible only to admins
+  if (admin) rows[0].push('📣 Post');
+  return Markup.keyboard(rows, { columns: 2 }).resize();
 }
 
-// Helper: send thread preview (thumbnail if available)
-async function sendThreadPreviewMessage(ctx, thread) {
-  if (!thread) return;
-  try {
-    // thread includes social_link, canonical_link, normalized_link
-    const link = thread.social_link || thread.canonical_link || thread.normalized_link;
-    const norm = await utils.normalizeVideoUrl(link).catch(()=>null);
-    if (norm && norm.thumbnail) {
-      await ctx.replyWithPhoto(norm.thumbnail, { caption: link });
-      return;
+// Inline markup for comment (shows reply, favorite, show replies, report, reactions, delete if owner or admin)
+async function buildCommentInline(commentId, fromUserId) {
+  const buttons = [];
+
+  // Reply & Favorite row
+  buttons.push([
+    Markup.button.callback('💬 Reply', `reply_menu|${commentId}`),
+    Markup.button.callback('☆ Favorite', `fav_toggle|${commentId}`)
+  ]);
+
+  // Show replies & Report
+  // show replies count
+  const replyCount = await db.countRepliesForComment(commentId).catch(()=>0);
+  buttons.push([
+    Markup.button.callback(`▶ Replies (${replyCount})`, `show_replies|${commentId}|1`),
+    Markup.button.callback('🚩 Report', `report_comment|${commentId}`)
+  ]);
+
+  // Reaction row (simple set)
+  buttons.push([
+    Markup.button.callback('❤️', `react|comment|${commentId}|heart`),
+    Markup.button.callback('😂', `react|comment|${commentId}|laugh`),
+    Markup.button.callback('😮', `react|comment|${commentId}|wow`)
+  ]);
+
+  // Delete if owner or admin
+  const comment = await db.getCommentById(commentId).catch(()=>null);
+  if (comment) {
+    if (Number(comment.user_telegram_id) === Number(fromUserId) || isAdmin(fromUserId)) {
+      buttons.push([ Markup.button.callback('🗑 Delete', `delete_comment|${commentId}`) ]);
     }
-    await ctx.reply(link || 'Video link');
-  } catch (e) { await ctx.reply(thread.social_link || thread.canonical_link || 'Video'); }
-}
-
-// Build inline keyboard for a comment (replies count, favorite toggle, reactions, report, delete if own)
-async function buildCommentInlineButtons(commentId, ctxUserId) {
-  // Favorite label
-  try {
-    const favQuery = await db.supabase.from('favorites').select('*').eq('telegram_id', ctxUserId).eq('comment_id', commentId).limit(1).maybeSingle();
-    const favRow = favQuery && (favQuery.data || favQuery);
-    const favLabel = favRow ? '★ Favorited' : '☆ Favorite';
-
-    // Count replies
-    const rcount = await db.supabase.from('replies').select('id', { count: 'exact' }).eq('comment_id', commentId).catch(()=>({ count: 0 }));
-    const repliesCount = rcount && rcount.count ? Number(rcount.count) : 0;
-
-    const rows = [
-      [ Markup.button.callback('💬 Reply', `replymenu|${commentId}`), Markup.button.callback(favLabel, `fav|${commentId}`) ],
-      [ Markup.button.callback(`▶️ Show replies (${repliesCount})`, `list_replies|${commentId}|1`), Markup.button.callback('🚩 Report', `report|${commentId}`) ],
-      [ Markup.button.callback('❤️', `react|${commentId}|heart`), Markup.button.callback('😂', `react|${commentId}|laugh`) ]
-    ];
-    // allow delete if owner or admin
-    const comment = await db.getCommentById(commentId).catch(()=>null);
-    if (comment && Number(comment.telegram_id) === Number(ctxUserId)) rows.push([ Markup.button.callback('🗑 Delete', `delete_my_comment|${commentId}`) ]);
-    if (isAdmin(ctxUserId)) rows.push([ Markup.button.callback('🗑 Admin Delete', `admin_delete_comment|${commentId}`) ]);
-    return Markup.inlineKeyboard(rows);
-  } catch (e) {
-    return Markup.inlineKeyboard([[ Markup.button.callback('🚩 Report', `report|${commentId}`) ]]);
   }
+
+  return Markup.inlineKeyboard(buttons);
 }
 
-// Build reply inline (replies have reaction + report only)
-function buildReplyInline(replyId, ctxUserId, commentId) {
+// Inline markup for reply (only reactions + report; admin can delete)
+function buildReplyInline(replyId, commentId, fromUserId) {
   const rows = [
-    [ Markup.button.callback('❤️', `rreact|${replyId}|heart`), Markup.button.callback('🚩 Report', `rreport|${replyId}|${commentId}`) ]
+    [ Markup.button.callback('❤️', `react|reply|${replyId}|heart`), Markup.button.callback('🚩 Report', `report_reply|${replyId}|${commentId}`) ]
   ];
-  if (isAdmin(ctxUserId)) rows.push([ Markup.button.callback('🗑 Admin Delete Reply', `admin_delete_reply|${replyId}`) ]);
+  if (isAdmin(fromUserId)) rows.push([ Markup.button.callback('🗑 Admin Delete', `admin_delete_reply|${replyId}`) ]);
   return Markup.inlineKeyboard(rows);
 }
 
-// Helper: show comments page (threadId, page)
-async function sendCommentsPage(ctx, threadId, page = 1) {
+// sendThreadPreview: shows link and thumbnail if utils returns thumbnail
+async function sendThreadPreview(ctx, thread) {
+  if (!thread) return;
   try {
-    const perPage = 8;
-    const offset = (page - 1) * perPage;
-    const comments = await db.listCommentsByThread(threadId, offset, perPage);
-    if (!comments || comments.length === 0) return ctx.reply('No comments for this video yet.');
-
-    for (const c of comments) {
-      // show thumbnail & link
-      const thread = await db.getThreadById(c.thread_id).catch(()=>null);
-      if (thread) await sendThreadPreviewMessage(ctx, thread);
-      if (c.telegram_file_id) await ctx.replyWithVoice(c.telegram_file_id);
-      // send code under voice
-      await ctx.reply(utils.encodeShortCode(c.id), await buildCommentInlineButtons(c.id, ctx.from.id));
+    const normalized = thread.normalized_link || thread.original_link;
+    const info = await utils.normalizeVideoUrl(thread.original_link || normalized);
+    if (info && info.thumbnail) {
+      await ctx.replyWithPhoto(info.thumbnail, { caption: thread.original_link || normalized });
+      return;
     }
-
-    // pagination
-    const countRes = await db.supabase.from('voice_comments').select('id', { count: 'exact' }).eq('thread_id', threadId);
-    const total = countRes && countRes.count ? Number(countRes.count) : 0;
-    if (offset + perPage < total) {
-      await ctx.reply('More comments:', Markup.inlineKeyboard([[ Markup.button.callback('More', `listen|${threadId}|${page+1}`) ]]));
-    }
+    await ctx.reply(thread.original_link || normalized);
   } catch (e) {
-    console.error('sendCommentsPage err', e);
-    return ctx.reply('Could not fetch comments.');
+    await ctx.reply(thread.original_link || 'Video link');
   }
 }
 
-/* ---------- Initialize bot ---------- */
-async function initBot() {
+// Build payment keyboard for confirm step
+function buildPaymentKeyboard(paymentRequestId) {
+  return Markup.inlineKeyboard([
+    [ Markup.button.callback('Copy TELEBIRR', `copy_number|${PAY_TELEBIRR_NUMBER}`), Markup.button.callback('Copy CBE', `copy_number|${PAY_CBE_NUMBER}`) ],
+    [ Markup.button.callback('Upload Proof', `upload_proof|${paymentRequestId}`) ]
+  ]);
+}
+
+// Encode/Decode shortcodes shown to users are handled in utils
+// utils.encodeShortCode / utils.decodeShortCode
+
+// ----- Initialize Bot -----
+function initBot() {
   const bot = new Telegraf(BOT_TOKEN);
 
+  // Start
   bot.start(async (ctx) => {
     try {
-      await db.ensureUserRow(ctx.from).catch(()=>null);
-      const balQ = await db.supabase.from('users').select('free_comments').eq('telegram_id', ctx.from.id).limit(1).maybeSingle().catch(()=>null);
-      const bal = (balQ && (balQ.data || balQ).free_comments) ? Number((balQ.data || balQ).free_comments) : 0;
-      await ctx.reply(`Welcome — available comments: *${bal}*`, { parse_mode: 'Markdown' });
-      await ctx.reply('Use the keyboard below.', userKeyboard(isAdmin(ctx.from.id)));
+      // ensure user exists
+      await db.ensureUser(ctx.from).catch(()=>null);
+      await ctx.reply(`Welcome ${ctx.from.first_name || ''}!`, buildMainKeyboard(ctx.from.id));
     } catch (e) {
       console.error('start err', e);
-      await ctx.reply('Welcome. Use the keyboard below.', userKeyboard(isAdmin(ctx.from.id)));
+      await ctx.reply('Welcome!', buildMainKeyboard(ctx.from.id));
     }
   });
 
-  // Admin post trigger text and keyboard
+  // POST (admin-only) - text/photo/voice
   bot.hears('📣 Post', async (ctx) => {
     if (!isAdmin(ctx.from.id)) return;
     Pending.set(ctx.from.id, { type: 'await_admin_post' });
-    return ctx.reply('Send the post content (text/photo/voice/document). It will be broadcast to users.');
+    return ctx.reply('Send the post content (text/photo/voice). It will be broadcast to users.');
   });
 
   // Support
-  bot.hears(/📞 Support|support/i, async (ctx) => {
-    if (WHATSAPP_LINK) return ctx.reply(`Contact admin: ${WHATSAPP_LINK}`);
+  bot.hears(/[📞] Support|support/i, async (ctx) => {
+    if (SERVICE_WHATSAPP) return ctx.reply(`Contact admin: ${SERVICE_WHATSAPP}`);
     return ctx.reply('Contact admin via Telegram.');
   });
 
   // Buy flow
   bot.hears(/🛒 Buy|buy/i, async (ctx) => {
-    const inline = PAYMENT_PACKAGES.map(p => [ Markup.button.callback(p.label, `select_pkg|${p.id}`) ]);
-    inline.push([ Markup.button.callback('Contact admin', 'contact_whatsapp') ]);
-    return ctx.reply('Choose a package:', Markup.inlineKeyboard(inline));
+    const inline = PAYMENT_PACKAGES.map(p => [ Markup.button.callback(p.label, `pkg_select|${p.id}`) ]);
+    inline.push([ Markup.button.callback('Contact admin', `contact_admin`) ]);
+    await ctx.reply('Choose a package:', Markup.inlineKeyboard(inline));
   });
 
   // Balance
   bot.hears(/💰 Balance|balance/i, async (ctx) => {
     try {
-      const q = await db.supabase.from('users').select('free_comments').eq('telegram_id', ctx.from.id).limit(1).maybeSingle();
-      const bal = q && (q.data || q).free_comments ? Number((q.data || q).free_comments) : 0;
-      return ctx.reply(`Your balance: *${bal}*`, { parse_mode: 'Markdown' });
+      const balance = await db.getBalance(ctx.from.id);
+      await ctx.reply(`Your available comments: *${balance}*`, { parse_mode: 'Markdown' });
     } catch (e) {
       console.error('balance err', e);
-      return ctx.reply('Could not fetch balance.');
+      await ctx.reply('Could not fetch balance.');
     }
   });
 
-  // Add Comment command
+  // Add Comment
   bot.hears(/🎥 Add Comment|add comment/i, async (ctx) => {
-    Pending.set(ctx.from.id, { type: 'await_link_for_add' });
-    return ctx.reply('Send the TikTok/YouTube link to add a voice comment for.');
+    Pending.set(ctx.from.id, { type: 'await_link_add' });
+    return ctx.reply('Send the TikTok / YouTube link you want to add a voice comment for.');
   });
 
-  // Listen Comments command
+  // Listen Comments
   bot.hears(/🎧 Listen Comments|listen comments/i, async (ctx) => {
-    Pending.set(ctx.from.id, { type: 'await_link_for_listen' });
-    return ctx.reply('Send the video link to listen comments.');
+    Pending.set(ctx.from.id, { type: 'await_link_listen' });
+    return ctx.reply('Send the TikTok / YouTube link to listen comments.');
   });
 
   // My Comments
   bot.hears(/💬 My Comments|my comments/i, async (ctx) => {
     try {
-      const rows = await db.listCommentsByUser(ctx.from.id);
+      const rows = await db.listMyComments(ctx.from.id);
       if (!rows || rows.length === 0) return ctx.reply('You have no comments yet.');
       for (const c of rows) {
-        const thread = c.thread_id ? await db.getThreadById(c.thread_id).catch(()=>null) : null;
-        if (thread) await sendThreadPreviewMessage(ctx, thread);
-        if (c.telegram_file_id) await ctx.replyWithVoice(c.telegram_file_id);
-        await ctx.reply(utils.encodeShortCode(c.id), await buildCommentInlineButtons(c.id, ctx.from.id));
+        // show thread preview if possible
+        if (c.thread_id) {
+          const thread = await db.getThreadById(c.thread_id).catch(()=>null);
+          if (thread) await sendThreadPreview(ctx, thread);
+        }
+        // send voice then code under it
+        if (c.file_id) await ctx.replyWithVoice(c.file_id);
+        const code = utils.encodeShortCode(c.id);
+        await ctx.reply(`${code}`, await buildCommentInline(c.id, ctx.from.id));
       }
     } catch (e) {
       console.error('my comments err', e);
-      return ctx.reply('Could not fetch your comments.');
+      await ctx.reply('Could not fetch your comments.');
     }
   });
 
   // Favorites
   bot.hears(/⭐ Favorites|favorites/i, async (ctx) => {
     try {
-      const favs = await db.listFavoritesForUser(ctx.from.id);
-      if (!favs || favs.length === 0) return ctx.reply('No favorites yet.');
+      const favs = await db.listFavorites(ctx.from.id);
+      if (!favs || favs.length === 0) return ctx.reply('You have no favorites yet.');
       for (const f of favs) {
         if (f.thread_id) {
           const thread = await db.getThreadById(f.thread_id).catch(()=>null);
-          if (thread) await sendThreadPreviewMessage(ctx, thread);
+          if (thread) await sendThreadPreview(ctx, thread);
         }
-        if (f.telegram_file_id) await ctx.replyWithVoice(f.telegram_file_id);
-        await ctx.reply(utils.encodeShortCode(f.id), await buildCommentInlineButtons(f.id, ctx.from.id));
+        if (f.file_id) await ctx.replyWithVoice(f.file_id);
+        await ctx.reply(utils.encodeShortCode(f.id), await buildCommentInline(f.id, ctx.from.id));
       }
     } catch (e) {
       console.error('favorites err', e);
-      return ctx.reply('Could not fetch favorites.');
+      await ctx.reply('Could not fetch favorites.');
     }
   });
 
-  // Search code
-  bot.hears(/🔎 Search|search/i, async (ctx) => {
+  // Search Code
+  bot.hears(/🔎 Search Code|search code|search/i, async (ctx) => {
     Pending.set(ctx.from.id, { type: 'await_search_code' });
-    return ctx.reply('Send the short code (e.g. 1FZ).');
+    return ctx.reply('Send the code (example: 1FZ) to search a comment or reply.');
   });
 
-  // Generic text handler
+  // Notifications
+  bot.hears(/🔔 Notifications|notifications/i, async (ctx) => {
+    try {
+      const notes = await db.listNotifications(ctx.from.id);
+      if (!notes || notes.length === 0) return ctx.reply('No notifications yet.');
+      for (const n of notes) {
+        await ctx.reply(`• ${n.type} — ${JSON.stringify(n.payload || {})}`);
+      }
+    } catch (e) {
+      console.error('notifications err', e);
+      await ctx.reply('Could not fetch notifications.');
+    }
+  });
+
+  // Generic text handler — this covers many pending flows (link send, report reasons, upload proof text, reply text)
   bot.on('text', async (ctx) => {
-    const txt = ctx.message.text;
     const uid = ctx.from.id;
+    const txt = ctx.message.text ? ctx.message.text.trim() : '';
     const pending = Pending.get(uid);
 
-    // Admin post content
+    // Admin Post (text)
     if (pending && pending.type === 'await_admin_post' && isAdmin(uid)) {
       Pending.delete(uid);
-      const text = txt.trim();
       try {
-        await db.addNotificationRow({ telegram_id: null, message: text, meta: { admin_id: uid, type: 'admin_post' } }).catch(()=>null);
-        // broadcast to users: fetch users then send (be cautious if large user base)
-        const { data: users } = await db.supabase.from('users').select('telegram_id').limit(500).catch(()=>({ data: [] }));
-        if (users && users.length) {
-          for (const u of users) {
-            try { await bot.telegram.sendMessage(u.telegram_id, `📣 Admin post:\n\n${text}`); } catch (e) {}
-          }
+        // Save admin post
+        await db.createAdminPost({ content_type: 'text', content: txt }).catch(()=>null);
+        // Broadcast to users (capped)
+        const users = await db.listUsers(500);
+        for (const u of users) {
+          try { await ctx.telegram.sendMessage(u.telegram_id, `📣 Admin Post:\n\n${txt}`); } catch (e) {}
         }
         return ctx.reply('Post published.');
       } catch (e) {
-        console.error('admin_post_text err', e);
+        console.error('admin post text err', e);
         return ctx.reply('Could not publish post.');
       }
     }
 
-    // Upload proof text (do not show payment id to user)
+    // Upload proof as text (user paste payment transaction link)
     if (pending && pending.type === 'await_upload_proof' && pending.paymentId) {
       Pending.delete(uid);
       try {
-        const proofText = txt.trim();
-        await db.updatePaymentStatus(pending.paymentId, 'proof_submitted', { proof_link: proofText }).catch(()=>null);
-        // notify admins with payment id (admins need id)
+        await db.submitPaymentProof(pending.paymentId, { proof_text: txt }).catch(()=>null);
+        // notify admins
         for (const adm of ADMIN_IDS) {
-          try { await bot.telegram.sendMessage(adm, `Payment proof submitted by ${uid}. Review and approve.`); } catch (e) {}
+          try { await ctx.telegram.sendMessage(adm, `Payment proof submitted by ${uid} — payment id: ${pending.paymentId}`); } catch (e) {}
         }
         return ctx.reply('Proof received. Admins will review.');
       } catch (e) {
@@ -268,16 +281,17 @@ async function initBot() {
       }
     }
 
-    // Report reason for a comment
-    if (pending && pending.type === 'await_report_reason' && pending.commentId) {
+    // Report reason for comment or reply
+    if (pending && pending.type === 'await_report_reason') {
+      const { targetType, targetId } = pending;
       Pending.delete(uid);
       try {
-        const reason = txt.trim();
-        await db.insertReport({ reporter_telegram_id: uid, comment_id: pending.commentId, reason });
+        await db.insertReport({ reporter_telegram_id: uid, target_type: targetType, target_id: targetId, reason: txt });
+        // notify admin
         for (const adm of ADMIN_IDS) {
-          try { await bot.telegram.sendMessage(adm, `🚨 Report: comment ${pending.commentId}\nReporter: ${uid}\nReason: ${reason}`); } catch (e) {}
+          try { await ctx.telegram.sendMessage(adm, `🚨 Report: ${targetType} ${targetId}\nReporter: ${uid}\nReason: ${txt}`); } catch (e) {}
         }
-        return ctx.reply('Report submitted to admins.');
+        return ctx.reply('Report sent to admins.');
       } catch (e) {
         console.error('report reason err', e);
         return ctx.reply('Could not submit report.');
@@ -287,101 +301,114 @@ async function initBot() {
     // Search code handler
     if (pending && pending.type === 'await_search_code') {
       Pending.delete(uid);
-      const code = txt.trim();
+      const code = txt;
       const id = utils.decodeShortCode(code);
-      if (!id) return ctx.reply('Invalid code. Make sure you typed it correctly.');
+      if (!id) return ctx.reply('Invalid code format.');
+      // Try comment first
       try {
         const comment = await db.getCommentById(id);
-        if (!comment) return ctx.reply('Comment not found.');
-        if (comment.thread_id) {
-          const thread = await db.getThreadById(comment.thread_id).catch(()=>null);
-          if (thread) await sendThreadPreviewMessage(ctx, thread);
+        if (comment) {
+          // send thread preview
+          if (comment.thread_id) {
+            const thread = await db.getThreadById(comment.thread_id).catch(()=>null);
+            if (thread) await sendThreadPreview(ctx, thread);
+          }
+          if (comment.file_id) await ctx.replyWithVoice(comment.file_id);
+          return ctx.reply(utils.encodeShortCode(comment.id), await buildCommentInline(comment.id, uid));
         }
-        if (comment.telegram_file_id) await ctx.replyWithVoice(comment.telegram_file_id);
-        return ctx.reply(utils.encodeShortCode(comment.id), await buildCommentInlineButtons(comment.id, uid));
+        // else try reply
+        const reply = await db.getReplyById(id);
+        if (reply) {
+          if (reply.file_id) await ctx.replyWithVoice(reply.file_id);
+          return ctx.reply(utils.encodeShortCode(reply.id), buildReplyInline(reply.id, reply.comment_id, uid));
+        }
+        return ctx.reply('Not found.');
       } catch (e) {
         console.error('search code err', e);
         return ctx.reply('Error searching code.');
       }
     }
 
-    // Add comment link provided
-    if (pending && pending.type === 'await_link_for_add') {
+    // Add comment: user sent a link
+    if (pending && pending.type === 'await_link_add') {
       Pending.delete(uid);
-      const link = utils.extractFirstUrl(txt) || txt.trim();
-      if (!link) return ctx.reply('No link detected. Send video link.');
+      const link = utils.extractFirstUrl(txt) || txt;
+      if (!link) return ctx.reply('No link detected. Send a valid TikTok or YouTube link.');
       try {
-        const thread = await db.findOrCreateThread(link, uid).catch(()=>null);
-        if (!thread) return ctx.reply('Could not process the link.');
-        Pending.set(uid, { type: 'await_add_comment_voice', threadId: thread.id });
-        return ctx.reply('Now send the voice to add as a comment. (voice costs 1 credit)');
+        const normalized = await utils.normalizeVideoUrl(link);
+        // findOrCreateThread returns thread row
+        const thread = await db.findOrCreateThread(link, uid);
+        Pending.set(uid, { type: 'await_voice_for_add', threadId: thread.id });
+        return ctx.reply('Send your voice now to add comment (costs 1 credit).');
       } catch (e) {
-        console.error('await_link_for_add err', e);
+        console.error('await_link_add err', e);
         return ctx.reply('Could not process the link.');
       }
     }
 
-    // Listen comments link provided
-    if (pending && pending.type === 'await_link_for_listen') {
+    // Listen comments: user sent a link
+    if (pending && pending.type === 'await_link_listen') {
       Pending.delete(uid);
-      const link = utils.extractFirstUrl(txt) || txt.trim();
-      if (!link) return ctx.reply('No link detected.');
+      const link = utils.extractFirstUrl(txt) || txt;
+      if (!link) return ctx.reply('No link detected. Send a valid link.');
       try {
-        const thread = await db.findOrCreateThread(link, null).catch(()=>null);
-        if (!thread || !thread.id) return ctx.reply('No comments for this video yet.');
-        return sendCommentsPage(ctx, thread.id, 1);
+        const thread = await db.findOrCreateThread(link, null);
+        if (!thread) return ctx.reply('No comments for this video yet.');
+        // Show first page of comments
+        await sendCommentsForThread(ctx, thread.id, 1);
+        return;
       } catch (e) {
-        console.error('listen link err', e);
-        return ctx.reply('Could not list comments for that video.');
+        console.error('await_link_listen err', e);
+        return ctx.reply('Could not process the link.');
       }
     }
 
-    // Reply text (should be set by replymenu)
-    if (pending && pending.type === 'reply_text' && pending.commentId) {
+    // Reply text: when pending.reply_text
+    if (pending && pending.type === 'await_reply_text') {
+      const commentId = pending.commentId;
       Pending.delete(uid);
       try {
-        const inserted = await db.insertReplyRow({
-          comment_id: pending.commentId,
-          replier_telegram_id: uid,
-          replier_username: ctx.from.username || null,
-          replier_first_name: ctx.from.first_name || null,
-          reply_text: txt.trim()
+        const inserted = await db.insertReply({
+          comment_id: commentId,
+          user_telegram_id: uid,
+          type: 'text',
+          text: txt
         });
-        // Notify owner
-        const comment = await db.getCommentById(pending.commentId).catch(()=>null);
-        if (comment && comment.telegram_id && Number(comment.telegram_id) !== Number(uid)) {
-          await db.addNotificationRow({ telegram_id: comment.telegram_id, message: `New reply to your comment ${utils.encodeShortCode(comment.id)}`, meta: { comment_id: comment.id } }).catch(()=>null);
-          try { await bot.telegram.sendMessage(comment.telegram_id, `New reply to your comment ${utils.encodeShortCode(comment.id)}`); } catch (e) {}
+        // notify owner of comment
+        const comment = await db.getCommentById(commentId).catch(()=>null);
+        if (comment && comment.user_telegram_id && Number(comment.user_telegram_id) !== Number(uid)) {
+          await db.insertNotification({ user_telegram_id: comment.user_telegram_id, type: 'reply', payload: { comment_id: commentId, reply_id: inserted.id } }).catch(()=>null);
+          try { await ctx.telegram.sendMessage(comment.user_telegram_id, `You have a new reply to your comment ${utils.encodeShortCode(comment.id)}`); } catch (e) {}
         }
         await ctx.reply('Reply saved.');
       } catch (e) {
-        console.error('reply_text save err', e);
-        return ctx.reply('Could not save reply.');
+        console.error('reply text save err', e);
+        await ctx.reply('Could not save reply.');
       }
+      return;
     }
 
-    // default
-    return ctx.reply('I did not understand. Press a button or send a video link.', userKeyboard(isAdmin(uid)));
+    // Default fallback
+    return ctx.reply('I did not understand. Use the keyboard or send a video link.', buildMainKeyboard(uid));
   });
 
-  // Photo handler (reply photo, admin post photo, upload proof photo)
+  // Photo handler
   bot.on('photo', async (ctx) => {
     const uid = ctx.from.id;
     const pending = Pending.get(uid);
     const photos = ctx.message.photo || [];
     const file = photos[photos.length - 1];
-    if (!file) return ctx.reply('No photo found.');
+    if (!file) return ctx.reply('No photo detected.');
 
-    // Admin post
+    // Admin post photo
     if (pending && pending.type === 'await_admin_post' && isAdmin(uid)) {
       Pending.delete(uid);
       try {
-        await db.addNotificationRow({ telegram_id: null, message: '(photo post)', meta: { admin_id: uid, telegram_file_id: file.file_id, type: 'photo' } }).catch(()=>null);
-        const { data: users } = await db.supabase.from('users').select('telegram_id').limit(500).catch(()=>({ data: [] }));
-        if (users && users.length) {
-          for (const u of users) {
-            try { await bot.telegram.sendPhoto(u.telegram_id, file.file_id, { caption: '📣 Admin post' }); } catch (e) {}
-          }
+        await db.createAdminPost({ content_type: 'photo', file_id: file.file_id }).catch(()=>null);
+        // broadcast
+        const users = await db.listUsers(500);
+        for (const u of users) {
+          try { await ctx.telegram.sendPhoto(u.telegram_id, file.file_id, { caption: '📣 Admin Post' }); } catch (e) {}
         }
         return ctx.reply('Post published.');
       } catch (e) {
@@ -390,15 +417,15 @@ async function initBot() {
       }
     }
 
-    // Upload proof
+    // Upload proof photo
     if (pending && pending.type === 'await_upload_proof' && pending.paymentId) {
       Pending.delete(uid);
       try {
-        await db.updatePaymentStatus(pending.paymentId, 'proof_submitted', { proof_telegram_file_id: file.file_id }).catch(()=>null);
+        await db.submitPaymentProof(pending.paymentId, { proof_file_id: file.file_id }).catch(()=>null);
         for (const adm of ADMIN_IDS) {
-          try { await bot.telegram.sendPhoto(adm, file.file_id, { caption: `Payment proof submitted by ${uid}` }); } catch (e) {}
+          try { await ctx.telegram.sendPhoto(adm, file.file_id, { caption: `Payment proof from ${uid} — payment id ${pending.paymentId}` }); } catch (e) {}
         }
-        return ctx.reply('Proof received. Admins will review.');
+        return ctx.reply('Proof uploaded. Admins will review.');
       } catch (e) {
         console.error('upload proof photo err', e);
         return ctx.reply('Could not submit proof.');
@@ -409,23 +436,23 @@ async function initBot() {
     if (pending && pending.type === 'await_reply_photo' && pending.commentId) {
       Pending.delete(uid);
       try {
-        const inserted = await db.insertReplyRow({
+        const inserted = await db.insertReply({
           comment_id: pending.commentId,
-          replier_telegram_id: uid,
-          replier_username: ctx.from.username || null,
-          replier_first_name: ctx.from.first_name || null,
-          telegram_file_id: file.file_id
+          user_telegram_id: uid,
+          type: 'photo',
+          file_id: file.file_id
         });
+        // notify comment owner
         const comment = await db.getCommentById(pending.commentId).catch(()=>null);
-        if (comment && comment.telegram_id && Number(comment.telegram_id) !== Number(uid)) {
-          await db.addNotificationRow({ telegram_id: comment.telegram_id, message: `New reply to your comment ${utils.encodeShortCode(comment.id)}` }).catch(()=>null);
-          try { await bot.telegram.sendMessage(comment.telegram_id, `New reply to your comment ${utils.encodeShortCode(comment.id)}`); } catch (e) {}
+        if (comment && comment.user_telegram_id && Number(comment.user_telegram_id) !== Number(uid)) {
+          await db.insertNotification({ user_telegram_id: comment.user_telegram_id, type: 'reply', payload: { comment_id: comment.id, reply_id: inserted.id } }).catch(()=>null);
+          try { await ctx.telegram.sendMessage(comment.user_telegram_id, `You have a new reply to your comment ${utils.encodeShortCode(comment.id)}`); } catch (e) {}
         }
         await ctx.replyWithPhoto(file.file_id);
-        await ctx.reply(utils.encodeShortCode(inserted.id), buildReplyInline(inserted.id, uid, pending.commentId));
+        await ctx.reply(utils.encodeShortCode(inserted.id), buildReplyInline(inserted.id, pending.commentId, uid));
         return;
       } catch (e) {
-        console.error('reply_photo err', e);
+        console.error('reply photo save err', e);
         return ctx.reply('Could not save reply photo.');
       }
     }
@@ -444,12 +471,10 @@ async function initBot() {
     if (pending && pending.type === 'await_admin_post' && isAdmin(uid)) {
       Pending.delete(uid);
       try {
-        await db.addNotificationRow({ telegram_id: null, message: '(voice post)', meta: { admin_id: uid, telegram_file_id: voice.file_id, type: 'voice' } }).catch(()=>null);
-        const { data: users } = await db.supabase.from('users').select('telegram_id').limit(500).catch(()=>({ data: [] }));
-        if (users && users.length) {
-          for (const u of users) {
-            try { await bot.telegram.sendVoice(u.telegram_id, voice.file_id, { caption: '📣 Admin post' }); } catch (e) {}
-          }
+        await db.createAdminPost({ content_type: 'voice', file_id: voice.file_id }).catch(()=>null);
+        const users = await db.listUsers(500);
+        for (const u of users) {
+          try { await ctx.telegram.sendVoice(u.telegram_id, voice.file_id, { caption: '📣 Admin Post' }); } catch (e) {}
         }
         return ctx.reply('Post published.');
       } catch (e) {
@@ -458,90 +483,80 @@ async function initBot() {
       }
     }
 
-    // Upload proof voice (unlikely but handle)
+    // Upload proof voice
     if (pending && pending.type === 'await_upload_proof' && pending.paymentId) {
       Pending.delete(uid);
       try {
-        await db.updatePaymentStatus(pending.paymentId, 'proof_submitted', { proof_telegram_file_id: voice.file_id }).catch(()=>null);
+        await db.submitPaymentProof(pending.paymentId, { proof_file_id: voice.file_id }).catch(()=>null);
         for (const adm of ADMIN_IDS) {
-          try { await bot.telegram.sendVoice(adm, voice.file_id, { caption: `Payment proof submitted by ${uid}` }); } catch (e) {}
+          try { await ctx.telegram.sendVoice(adm, voice.file_id, { caption: `Payment proof from ${uid}` }); } catch (e) {}
         }
-        return ctx.reply('Proof received. Admins will review.');
+        return ctx.reply('Proof uploaded. Admins will review.');
       } catch (e) {
         console.error('upload proof voice err', e);
         return ctx.reply('Could not submit proof.');
       }
     }
 
-    // Add comment voice
-    if (pending && pending.type === 'await_add_comment_voice' && pending.threadId) {
-      // check balance
+    // Add comment voice (cost)
+    if (pending && pending.type === 'await_voice_for_add' && pending.threadId) {
       try {
-        const userRow = await db.supabase.from('users').select('free_comments').eq('telegram_id', uid).limit(1).maybeSingle();
-        const bal = (userRow && (userRow.data || userRow).free_comments) ? Number((userRow.data || userRow).free_comments) : 0;
-        if (bal <= 0) return ctx.reply('Pay before comment. Your balance is 0.');
+        // Check balance
+        const balance = await db.getBalance(uid);
+        if (balance <= 0) return ctx.reply('Pay before comment — your balance is 0.');
         Pending.delete(uid);
-        const inserted = await db.insertVoiceComment({
+        // insert voice comment
+        const inserted = await db.insertComment({
           thread_id: pending.threadId,
-          telegram_id: uid,
-          username: ctx.from.username || null,
-          first_name: ctx.from.first_name || null,
-          telegram_file_id: voice.file_id
+          user_telegram_id: uid,
+          file_id: voice.file_id,
+          duration: voice.duration || 0
         });
         // debit 1 credit
-        await db.ensureUserRow(uid).catch(()=>null);
-        await db.supabase.from('users').upsert({ telegram_id: uid, free_comments: Math.max(0, bal - 1) }, { onConflict: ['telegram_id'] }).catch(()=>null);
-        // send voice then code (code under voice)
+        await db.changeBalance(uid, -1).catch(()=>null);
+        // send voice then code under it
         await ctx.replyWithVoice(voice.file_id);
-        await ctx.reply(utils.encodeShortCode(inserted.id), await buildCommentInlineButtons(inserted.id, uid));
-        // notify trackers of this thread (match by thread's normalized link)
-        try {
-          const trackers = await db.listTrackersForThread(pending.threadId);
-          if (trackers && trackers.length) {
-            for (const t of trackers) {
-              if (Number(t.tracker_telegram_id) !== Number(uid)) {
-                await db.addNotificationRow({ telegram_id: t.tracker_telegram_id, message: `New comment on tracked video`, meta: { comment_id: inserted.id } }).catch(()=>null);
-                try { await bot.telegram.sendMessage(t.tracker_telegram_id, `New comment on a video you track`); } catch (e) {}
-              }
-            }
+        await ctx.reply(utils.encodeShortCode(inserted.id), await buildCommentInline(inserted.id, uid));
+        // Notify trackers of thread
+        const trackers = await db.listTrackersForThread(pending.threadId).catch(()=>[]);
+        for (const t of trackers) {
+          if (Number(t.user_telegram_id) !== Number(uid)) {
+            try { await ctx.telegram.sendMessage(t.user_telegram_id, `New comment on a tracked video`); } catch (e) {}
+            await db.insertNotification({ user_telegram_id: t.user_telegram_id, type: 'tracked_comment', payload: { comment_id: inserted.id } }).catch(()=>null);
           }
-        } catch (e) { /* ignore tracker notify errors */ }
+        }
         return;
       } catch (e) {
-        console.error('insertVoiceComment err', e);
+        console.error('insert comment err', e);
         return ctx.reply('Could not save voice comment.');
       }
     }
 
-    // Reply voice
+    // Reply voice (cost)
     if (pending && pending.type === 'await_reply_voice' && pending.commentId) {
-      // check balance
       try {
-        const userRow = await db.supabase.from('users').select('free_comments').eq('telegram_id', uid).limit(1).maybeSingle();
-        const bal = (userRow && (userRow.data || userRow).free_comments) ? Number((userRow.data || userRow).free_comments) : 0;
-        if (bal <= 0) return ctx.reply('Pay before comment. Your balance is 0.');
+        const balance = await db.getBalance(uid);
+        if (balance <= 0) return ctx.reply('Pay before comment — your balance is 0.');
         Pending.delete(uid);
-        const inserted = await db.insertReplyRow({
+        const inserted = await db.insertReply({
           comment_id: pending.commentId,
-          replier_telegram_id: uid,
-          replier_username: ctx.from.username || null,
-          replier_first_name: ctx.from.first_name || null,
-          telegram_file_id: voice.file_id
+          user_telegram_id: uid,
+          type: 'voice',
+          file_id: voice.file_id,
+          duration: voice.duration || 0
         });
-        // debit credit
-        await db.ensureUserRow(uid).catch(()=>null);
-        await db.supabase.from('users').upsert({ telegram_id: uid, free_comments: Math.max(0, bal - 1) }, { onConflict: ['telegram_id'] }).catch(()=>null);
-        // notify comment owner
+        await db.changeBalance(uid, -1).catch(()=>null);
+        // notify owner
         const comment = await db.getCommentById(pending.commentId).catch(()=>null);
-        if (comment && comment.telegram_id && Number(comment.telegram_id) !== Number(uid)) {
-          await db.addNotificationRow({ telegram_id: comment.telegram_id, message: `New reply to your comment ${utils.encodeShortCode(comment.id)}` }).catch(()=>null);
-          try { await bot.telegram.sendMessage(comment.telegram_id, `New reply to your comment ${utils.encodeShortCode(comment.id)}`); } catch (e) {}
+        if (comment && comment.user_telegram_id && Number(comment.user_telegram_id) !== Number(uid)) {
+          await db.insertNotification({ user_telegram_id: comment.user_telegram_id, type: 'reply', payload: { comment_id: comment.id, reply_id: inserted.id } }).catch(()=>null);
+          try { await ctx.telegram.sendMessage(comment.user_telegram_id, `New reply to your comment ${utils.encodeShortCode(comment.id)}`); } catch (e) {}
         }
         await ctx.replyWithVoice(voice.file_id);
-        await ctx.reply(utils.encodeShortCode(inserted.id), buildReplyInline(inserted.id, uid, pending.commentId));
+        await ctx.reply(utils.encodeShortCode(inserted.id), buildReplyInline(inserted.id, pending.commentId, uid));
         return;
       } catch (e) {
-        console.error('insertReplyRow err', e);
+        console.error('insert reply voice err', e);
         return ctx.reply('Could not save reply.');
       }
     }
@@ -549,239 +564,309 @@ async function initBot() {
     return ctx.reply('No expected action for voice now.');
   });
 
-  // Callback queries handler
+  // Callback query handler (inline buttons)
   bot.on('callback_query', async (ctx) => {
-    const data = ctx.callbackQuery && ctx.callbackQuery.data;
-    if (!data) return ctx.answerCbQuery();
+    const q = ctx.callbackQuery;
+    const uid = ctx.from.id;
+    if (!q || !q.data) return ctx.answerCbQuery();
+    const data = q.data;
     const parts = data.split('|');
-    const cmd = parts[0], a1 = parts[1], a2 = parts[2];
+    const cmd = parts[0];
 
-    Pending.delete(ctx.from.id); // clear pending on any callback
+    // Clear user's pending when they click an inline button (prevents stale pending)
+    Pending.delete(uid);
 
     try {
-      if (cmd === 'select_pkg') {
-        const pkg = PAYMENT_PACKAGES.find(p => p.id === a1);
-        if (!pkg) return ctx.answerCbQuery('Invalid package');
-        const inline = Markup.inlineKeyboard([[ Markup.button.callback(`Confirm ${pkg.label}`, `confirm_pkg|${pkg.id}`), Markup.button.callback('Cancel', 'cancel_action') ]]);
-        await ctx.reply(`You selected ${pkg.label}. Confirm to get payment details.`, inline);
+      // ========== Payment package select ==========
+      if (cmd === 'pkg_select') {
+        const pkgId = parts[1];
+        const pkg = PAYMENT_PACKAGES.find(p => p.id === pkgId);
+        if (!pkg) return ctx.answerCbQuery('Package not found');
+        // Confirm step: show confirm & cancel
+        const inline = Markup.inlineKeyboard([
+          [ Markup.button.callback(`Confirm ${pkg.label}`, `pkg_confirm|${pkgId}`), Markup.button.callback('Cancel', `pkg_cancel`) ]
+        ]);
+        await ctx.reply(`You selected ${pkg.label}. Press Confirm to get payment details.`, inline);
         return ctx.answerCbQuery();
       }
 
-      if (cmd === 'confirm_pkg') {
-        const pkg = PAYMENT_PACKAGES.find(p => p.id === a1);
-        if (!pkg) return ctx.answerCbQuery('Invalid package');
-        try {
-          const created = await db.createPaymentRequest({ telegram_id: ctx.from.id, package_name: pkg.label, comments_amount: pkg.credits, amount: pkg.amount });
-          // Provide payment details without showing payment id to user
-          const paymentText = `${PAYMENT_RECIPIENT.telebirr_name}\nTELEBIRR: ${PAYMENT_RECIPIENT.telebirr_number}\n${PAYMENT_RECIPIENT.cbe_name}\nCBE: ${PAYMENT_RECIPIENT.cbe_number}\nAmount: ${pkg.amount} ETB\n\nCopy the number and pay, then press Upload Proof.`;
-          const inline = Markup.inlineKeyboard([
-            [ Markup.button.callback('Copy TELEBIRR', `copy_number|${PAYMENT_RECIPIENT.telebirr_number}`), Markup.button.callback('Copy CBE', `copy_number|${PAYMENT_RECIPIENT.cbe_number}`) ],
-            [ Markup.button.callback('Upload Proof', `upload_proof|${created.id}`) ],
-            [ Markup.button.url('Contact admin', WHATSAPP_LINK || 'https://t.me/' + (ADMIN_IDS[0] || '')) ]
-          ]);
-          await ctx.reply(paymentText);
-          await ctx.reply('Payment options:', inline);
-          // notify admins with payment id
-          for (const adm of ADMIN_IDS) {
-            try { await bot.telegram.sendMessage(adm, `New payment request by ${ctx.from.id} — ${pkg.label}. ID: ${created.id}`); } catch (e) {}
-          }
-          return ctx.answerCbQuery();
-        } catch (e) {
-          console.error('confirm_pkg err', e);
-          return ctx.reply('Could not create payment request. Contact support.');
+      if (cmd === 'pkg_confirm') {
+        const pkgId = parts[1];
+        const pkg = PAYMENT_PACKAGES.find(p => p.id === pkgId);
+        if (!pkg) return ctx.answerCbQuery('Package not found');
+
+        // create payment request in DB
+        const payment = await db.createPaymentRequest({ user_telegram_id: uid, package_name: pkg.label, amount: pkg.amount, credits: pkg.credits });
+        // Provide payment details (without showing internal DB id in public)
+        const text = `Pay to:\n${PAY_RECIPIENT_NAME}\nTELEBIRR: ${PAY_TELEBIRR_NUMBER}\nCBE: ${PAY_CBE_NUMBER}\nAmount: ${pkg.amount} ETB\n\nAfter payment, press Upload Proof and send photo or link.`;
+        await ctx.reply(text, buildPaymentKeyboard(payment.id));
+        // notify admins with payment id (admins need internal id)
+        for (const adm of ADMIN_IDS) {
+          try { await ctx.telegram.sendMessage(adm, `New payment request by ${uid}: ${pkg.label} — payment id ${payment.id}`); } catch (e) {}
         }
+        return ctx.answerCbQuery();
       }
 
+      if (cmd === 'pkg_cancel') {
+        await ctx.answerCbQuery('Cancelled');
+        return ctx.reply('Purchase cancelled.', buildMainKeyboard(uid));
+      }
+
+      // copy number
       if (cmd === 'copy_number') {
+        const number = parts[1];
         await ctx.answerCbQuery('Number shown');
-        return ctx.reply(a1);
+        return ctx.reply(number);
       }
 
+      // upload_proof
       if (cmd === 'upload_proof') {
-        const pid = Number(a1);
-        Pending.set(ctx.from.id, { type: 'await_upload_proof', paymentId: pid });
+        const paymentId = Number(parts[1]);
+        Pending.set(uid, { type: 'await_upload_proof', paymentId });
         await ctx.answerCbQuery();
-        return ctx.reply('Send the proof image or paste the link. (The payment id will not be shown to other users.)');
+        return ctx.reply('Send proof image or paste proof link now.');
       }
 
-      if (cmd === 'addvoice') {
-        const threadId = a1 ? Number(a1) : null;
-        if (!threadId) {
-          await ctx.answerCbQuery('No thread id');
-          return ctx.reply('Could not find the video.');
+      // contact_admin
+      if (cmd === 'contact_admin') {
+        await ctx.answerCbQuery();
+        if (SERVICE_WHATSAPP) return ctx.reply(`Contact admin: ${SERVICE_WHATSAPP}`);
+        return ctx.reply(`Contact admin via Telegram.`);
+      }
+
+      // favorite toggle
+      if (cmd === 'fav_toggle') {
+        const commentId = Number(parts[1]);
+        try {
+          const toggled = await db.toggleFavorite(uid, commentId);
+          await ctx.answerCbQuery(toggled.added ? 'Added to favorite' : 'Removed favorite');
+          // update inline markup on message (best effort)
+          try {
+            await ctx.editMessageReplyMarkup((await buildCommentInline(commentId, uid)).reply_markup).catch(()=>null);
+          } catch (e) {}
+        } catch (e) {
+          console.error('fav_toggle err', e);
+          await ctx.answerCbQuery('Error toggling favorite');
         }
-        Pending.set(ctx.from.id, { type: 'await_add_comment_voice', threadId });
-        await ctx.answerCbQuery('Send voice to add as comment');
-        return ctx.reply('Send voice now. (voice costs 1 credit)');
-      }
-
-      if (cmd === 'listen') {
-        const threadId = a1 ? Number(a1) : null;
-        const page = Number(a2 || 1);
-        if (!threadId) { await ctx.answerCbQuery('No thread'); return; }
-        await sendCommentsPage(ctx, threadId, page);
-        return ctx.answerCbQuery();
+        return;
       }
 
       // reply menu
-      if (cmd === 'replymenu') {
-        const commentId = Number(a1);
+      if (cmd === 'reply_menu') {
+        const commentId = Number(parts[1]);
         const inline = Markup.inlineKeyboard([
           [ Markup.button.callback('Reply Text (free)', `reply_text|${commentId}`), Markup.button.callback('Reply Photo (free)', `reply_photo|${commentId}`) ],
-          [ Markup.button.callback('Reply Voice (costs 1)', `reply_voice|${commentId}`) ]
+          [ Markup.button.callback('Reply Voice (costs 1)', `reply_voice|${commentId}`) ],
+          [ Markup.button.callback('Cancel', `cancel`) ]
         ]);
         await ctx.reply('Choose reply type:', inline);
         return ctx.answerCbQuery();
       }
 
+      // reply_text
       if (cmd === 'reply_text') {
-        Pending.set(ctx.from.id, { type: 'reply_text', commentId: Number(a1) });
-        await ctx.answerCbQuery('Send text reply now');
-        return ctx.reply('Send your reply text now.');
+        const commentId = Number(parts[1]);
+        Pending.set(uid, { type: 'await_reply_text', commentId });
+        await ctx.answerCbQuery();
+        return ctx.reply('Send your text reply now.');
       }
+
+      // reply_photo
       if (cmd === 'reply_photo') {
-        Pending.set(ctx.from.id, { type: 'await_reply_photo', commentId: Number(a1) });
-        await ctx.answerCbQuery('Send photo to reply');
-        return ctx.reply('Send your photo to reply now (free).');
+        const commentId = Number(parts[1]);
+        Pending.set(uid, { type: 'await_reply_photo', commentId });
+        await ctx.answerCbQuery();
+        return ctx.reply('Send photo now (free).');
       }
+
+      // reply_voice
       if (cmd === 'reply_voice') {
-        Pending.set(ctx.from.id, { type: 'await_reply_voice', commentId: Number(a1) });
-        await ctx.answerCbQuery('Send voice reply now');
-        return ctx.reply('Send your voice reply now (costs 1 credit).');
+        const commentId = Number(parts[1]);
+        Pending.set(uid, { type: 'await_reply_voice', commentId });
+        await ctx.answerCbQuery();
+        return ctx.reply('Send voice now (costs 1 credit).');
       }
 
-      // react to comment
-      if (cmd === 'react') {
-        const commentId = Number(a1), type = a2;
-        try {
-          const { data: existing } = await db.supabase.from('reactions').select('*').eq('comment_id', commentId).eq('telegram_id', ctx.from.id).limit(1).maybeSingle();
-          const exists = existing && (existing.data || existing);
-          if (exists) {
-            if (exists.type === type) await db.supabase.from('reactions').delete().eq('id', exists.id).catch(()=>null);
-            else await db.supabase.from('reactions').update({ type }).eq('id', exists.id).catch(()=>null);
-          } else await db.insertReactionRow({ comment_id: commentId, telegram_id: ctx.from.id, type });
-          await ctx.answerCbQuery('Saved');
-          // refresh inline markup (best effort)
-          try { await ctx.editMessageReplyMarkup((await buildCommentInlineButtons(commentId, ctx.from.id)).reply_markup).catch(()=>null); } catch (e) {}
-        } catch (e) {
-          console.error('react err', e);
-          await ctx.answerCbQuery('Error');
-        }
+      // show_replies with pagination
+      if (cmd === 'show_replies') {
+        const commentId = Number(parts[1]);
+        const page = Number(parts[2] || 1);
+        await ctx.answerCbQuery();
+        await sendRepliesForComment(ctx, commentId, page);
         return;
       }
 
-      // react to reply
-      if (cmd === 'rreact') {
-        const replyId = Number(a1), type = a2;
-        try {
-          const { data: existing } = await db.supabase.from('reactions').select('*').eq('reply_id', replyId).eq('telegram_id', ctx.from.id).limit(1).maybeSingle();
-          const exists = existing && (existing.data || existing);
-          if (exists) {
-            if (exists.type === type) await db.supabase.from('reactions').delete().eq('id', exists.id).catch(()=>null);
-            else await db.supabase.from('reactions').update({ type }).eq('id', exists.id).catch(()=>null);
-          } else await db.insertReactionRow({ reply_id: replyId, telegram_id: ctx.from.id, type });
-          await ctx.answerCbQuery('Saved');
-        } catch (e) { console.error('rreact err', e); await ctx.answerCbQuery('Error'); }
-        return;
-      }
-
-      // favorite toggle
-      if (cmd === 'fav') {
-        const id = Number(a1);
-        try {
-          const res = await db.toggleFavoriteRow(ctx.from.id, id);
-          await ctx.answerCbQuery(res.removed ? 'Favorite removed' : 'Favorite added');
-          try { await ctx.editMessageReplyMarkup((await buildCommentInlineButtons(id, ctx.from.id)).reply_markup).catch(()=>null); } catch (e) {}
-        } catch (e) { console.error('fav err', e); await ctx.answerCbQuery('Error'); }
-        return;
-      }
-
-      // list replies
-      if (cmd === 'list_replies') {
-        const commentId = Number(a1), page = Number(a2 || 1);
-        try {
-          const perPage = 5, offset = (page - 1) * perPage;
-          const replies = await db.listReplies(commentId, offset, perPage);
-          if (!replies || replies.length === 0) { await ctx.reply('No replies yet.'); await ctx.answerCbQuery(); return; }
-          for (const r of replies) {
-            if (r.telegram_file_id) await ctx.replyWithVoice(r.telegram_file_id, { caption: r.replier_first_name || r.replier_username || 'User' });
-            else await ctx.reply(`${r.replier_first_name || r.replier_username || 'User'}: ${r.reply_text || '(no text)'}`);
-            await ctx.reply(utils.encodeShortCode(r.id), buildReplyInline(r.id, ctx.from.id, commentId));
-          }
-          const countRes = await db.supabase.from('replies').select('id', { count: 'exact' }).eq('comment_id', commentId);
-          const total = (countRes && countRes.count) ? Number(countRes.count) : 0;
-          if (offset + perPage < total) await ctx.reply('More replies:', Markup.inlineKeyboard([[ Markup.button.callback('More', `list_replies|${commentId}|${page+1}`) ]]));
-          return ctx.answerCbQuery();
-        } catch (e) { console.error('list_replies err', e); await ctx.answerCbQuery('Error'); }
+      // show thread comments (listen)
+      if (cmd === 'show_comments') {
+        const threadId = Number(parts[1]);
+        const page = Number(parts[2] || 1);
+        await ctx.answerCbQuery();
+        await sendCommentsForThread(ctx, threadId, page);
         return;
       }
 
       // report comment
-      if (cmd === 'report') {
-        Pending.set(ctx.from.id, { type: 'await_report_reason', commentId: Number(a1) });
+      if (cmd === 'report_comment') {
+        const commentId = Number(parts[1]);
+        Pending.set(uid, { type: 'await_report_reason', targetType: 'comment', targetId: commentId });
         await ctx.answerCbQuery();
-        return ctx.reply('Please explain in short why you report this comment.');
+        return ctx.reply('Please explain briefly why you report this comment.');
       }
 
-      // report reply
-      if (cmd === 'rreport') {
-        Pending.set(ctx.from.id, { type: 'await_report_reason', replyId: Number(a1) });
+      // report_reply
+      if (cmd === 'report_reply') {
+        const replyId = Number(parts[1]);
+        const commentId = Number(parts[2]);
+        Pending.set(uid, { type: 'await_report_reason', targetType: 'reply', targetId: replyId, commentId });
         await ctx.answerCbQuery();
-        return ctx.reply('Please explain in short why you report this reply.');
+        return ctx.reply('Please explain briefly why you report this reply.');
       }
 
-      // delete my comment
-      if (cmd === 'delete_my_comment') {
-        const commentId = Number(a1);
-        try {
-          const comment = await db.getCommentById(commentId);
-          if (!comment) { await ctx.answerCbQuery('Not found'); return; }
-          if (Number(comment.telegram_id) !== Number(ctx.from.id) && !isAdmin(ctx.from.id)) { await ctx.answerCbQuery('Not authorized'); return; }
-          await db.deleteCommentById(commentId).catch(()=>null);
-          await ctx.answerCbQuery('Deleted');
-          return ctx.reply('Comment deleted.');
-        } catch (e) { console.error('delete_my_comment err', e); await ctx.answerCbQuery('Error'); }
-        return;
+      // delete comment (user or admin)
+      if (cmd === 'delete_comment') {
+        const commentId = Number(parts[1]);
+        const comment = await db.getCommentById(commentId);
+        if (!comment) { await ctx.answerCbQuery('Not found'); return ctx.reply('Comment not found.'); }
+        if (Number(comment.user_telegram_id) !== Number(uid) && !isAdmin(uid)) { await ctx.answerCbQuery('Not authorized'); return ctx.reply('Not authorized to delete.'); }
+        await db.deleteComment(commentId).catch(()=>null);
+        await ctx.answerCbQuery('Deleted');
+        return ctx.reply('Comment deleted.');
       }
 
-      // admin approve payment
-      if (cmd === 'admin_approve') {
-        if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery('Admin only');
-        const pid = Number(a1);
+      // admin_delete_reply
+      if (cmd === 'admin_delete_reply') {
+        if (!isAdmin(uid)) { await ctx.answerCbQuery('Admin only'); return; }
+        const replyId = Number(parts[1]);
+        await db.deleteReply(replyId).catch(()=>null);
+        await ctx.answerCbQuery('Deleted');
+        return ctx.reply('Reply deleted.');
+      }
+
+      // approve payment (admin)
+      if (cmd === 'approve_payment') {
+        if (!isAdmin(uid)) { await ctx.answerCbQuery('Admin only'); return; }
+        const paymentId = Number(parts[1]);
         try {
-          const payment = await db.getPaymentById(pid);
-          if (!payment) { await ctx.answerCbQuery('Payment not found'); return; }
-          await db.ensureUserRow(payment.telegram_id).catch(()=>null);
-          const userQ = await db.supabase.from('users').select('free_comments').eq('telegram_id', payment.telegram_id).limit(1).maybeSingle();
-          const current = userQ && (userQ.data || userQ).free_comments ? Number((userQ.data || userQ).free_comments) : 0;
-          const newBal = current + Number(payment.comments_amount || 0);
-          await db.supabase.from('users').upsert({ telegram_id: payment.telegram_id, free_comments: newBal }, { onConflict: ['telegram_id'] }).catch(()=>null);
-          await db.updatePaymentStatus(pid, 'approved', { approved_by: ctx.from.id, approved_at: new Date().toISOString() }).catch(()=>null);
-          try { await bot.telegram.sendMessage(payment.telegram_id, `Your payment was approved. You received ${payment.comments_amount} comments.`); } catch (e) {}
+          const payment = await db.getPayment(paymentId);
+          if (!payment) { await ctx.answerCbQuery('Payment not found'); return ctx.reply('Payment not found.'); }
+          // credit user
+          await db.creditUser(payment.user_telegram_id, payment.credits).catch(()=>null);
+          await db.setPaymentStatus(paymentId, 'approved', { approved_by: uid }).catch(()=>null);
+          try { await ctx.telegram.sendMessage(payment.user_telegram_id, `Your payment request is approved. You received ${payment.credits} comments.`); } catch (e) {}
           await ctx.answerCbQuery('Approved');
-          return ctx.reply(`Payment approved and credited.`);
+          return ctx.reply('Payment approved and credited.');
         } catch (e) {
-          console.error('admin_approve err', e);
-          await ctx.answerCbQuery('Error Approving');
+          console.error('approve_payment err', e);
+          await ctx.answerCbQuery('Error approving');
           return ctx.reply('Error approving payment.');
         }
       }
 
-      // cancel action
-      if (cmd === 'cancel_action') {
-        Pending.delete(ctx.from.id);
-        await ctx.answerCbQuery();
-        return ctx.reply('Canceled.', userKeyboard(isAdmin(ctx.from.id)));
+      // cancel button
+      if (cmd === 'cancel') {
+        Pending.delete(uid);
+        await ctx.answerCbQuery('Cancelled');
+        return ctx.reply('Cancelled.', buildMainKeyboard(uid));
+      }
+
+      // copy number quick response (just reveal)
+      if (cmd === 'copy_number') {
+        const number = parts[1];
+        await ctx.answerCbQuery('Number shown');
+        return ctx.reply(number);
+      }
+
+      // react to comment or reply (toggle/change)
+      if (cmd === 'react') {
+        // format: react|targetType|targetId|emoji
+        const targetType = parts[1]; // comment or reply
+        const targetId = Number(parts[2]);
+        const emoji = parts[3];
+        try {
+          await db.toggleReaction({ user_telegram_id: uid, target_type: targetType, target_id: targetId, emoji });
+          await ctx.answerCbQuery('Saved');
+          return;
+        } catch (e) {
+          console.error('react err', e);
+          await ctx.answerCbQuery('Error');
+          return;
+        }
       }
 
       return ctx.answerCbQuery();
     } catch (e) {
-      console.error('callback err', e);
-      return ctx.answerCbQuery('Error');
+      console.error('callback_query handler err', e);
+      try { await ctx.answerCbQuery('Error'); } catch (e) {}
+      return;
     }
   });
+
+  // ========== helper functions inside bot.js ==========
+
+  // send comments for a thread with pagination
+  async function sendCommentsForThread(ctx, threadId, page = 1) {
+    try {
+      const perPage = 6;
+      const offset = (page - 1) * perPage;
+      const comments = await db.listCommentsByThread(threadId, perPage, offset);
+      if (!comments || comments.length === 0) return ctx.reply('No comments for this video yet.');
+      for (const c of comments) {
+        // preview thread (only on first comment)
+        const thread = await db.getThreadById(threadId).catch(()=>null);
+        if (thread) await sendThreadPreview(ctx, thread);
+        // send voice
+        if (c.file_id) await ctx.replyWithVoice(c.file_id);
+        // send code below the voice
+        await ctx.reply(utils.encodeShortCode(c.id), await buildCommentInline(c.id, ctx.from.id));
+      }
+      // pagination
+      const total = await db.countCommentsForThread(threadId);
+      if (offset + perPage < total) {
+        await ctx.reply('More comments:', Markup.inlineKeyboard([[ Markup.button.callback('More', `show_comments|${threadId}|${page+1}`) ]]));
+      }
+    } catch (e) {
+      console.error('sendCommentsForThread err', e);
+      await ctx.reply('Could not list comments for this video.');
+    }
+  }
+
+  // send replies for a comment with pagination
+  async function sendRepliesForComment(ctx, commentId, page = 1) {
+    try {
+      const perPage = 5;
+      const offset = (page - 1) * perPage;
+      const replies = await db.listReplies(commentId, perPage, offset);
+      if (!replies || replies.length === 0) return ctx.reply('No replies yet.');
+      for (const r of replies) {
+        if (r.type === 'voice' && r.file_id) {
+          await ctx.replyWithVoice(r.file_id, { caption: `Reply by ${r.user_telegram_id}` });
+        } else if (r.type === 'photo' && r.file_id) {
+          await ctx.replyWithPhoto(r.file_id, { caption: `Reply by ${r.user_telegram_id}` });
+        } else {
+          await ctx.reply(`${r.user_telegram_id}: ${r.text || ''}`);
+        }
+        await ctx.reply(utils.encodeShortCode(r.id), buildReplyInline(r.id, commentId, ctx.from.id));
+      }
+      const total = await db.countRepliesForComment(commentId);
+      if (offset + perPage < total) {
+        await ctx.reply('More replies:', Markup.inlineKeyboard([[ Markup.button.callback('More', `show_replies|${commentId}|${page+1}`) ]]));
+      }
+    } catch (e) {
+      console.error('sendRepliesForComment err', e);
+      await ctx.reply('Could not list replies.');
+    }
+  }
+
+  // ========== end helper functions ==========
+
+  // Launch: in serverless environment we will not call bot.launch() here.
+  // But if running locally, you can start polling:
+  if (process.env.NODE_ENV !== 'production') {
+    bot.launch().then(()=>console.log('Bot launched (polling)'));
+  }
 
   return bot;
 }
 
+// Export initializer for serverless wrapper
 module.exports = { initBot };
