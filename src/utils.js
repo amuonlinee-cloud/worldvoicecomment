@@ -32,15 +32,14 @@ function normalizeVideoUrl(link) {
   if (t && t[1]) {
     const id = t[1];
     const normalized = `tiktok:${id}`;
-    // TikTok thumbnails are not reliably available via static URL; set null
     const canonical = `https://www.tiktok.com/share/video/${id}`;
+    // TikTok thumbnails aren't reliably accessible via static link; leave thumbnail null
     return { normalized_link: normalized, provider: 'tiktok', provider_id: id, thumbnail: null, canonical_link: canonical };
   }
 
-  // Other providers: use host path
+  // generic host-normalized path
   try {
     const url = new URL(l);
-    // remove query strings for normalized path
     const normalized = `${url.hostname}${url.pathname}`.replace(/\/+$/, '');
     return { normalized_link: normalized, provider: url.hostname, provider_id: null, thumbnail: null, canonical_link: l };
   } catch (e) {
@@ -48,7 +47,7 @@ function normalizeVideoUrl(link) {
   }
 }
 
-// Shortcode encoding/decoding: base36 uppercase
+// Shortcode encode/decode base36 uppercase
 function encodeShortCode(id) {
   if (id === null || id === undefined) return null;
   const n = Number(id);
